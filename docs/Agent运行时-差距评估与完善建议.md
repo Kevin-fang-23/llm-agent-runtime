@@ -39,7 +39,7 @@
 ### 1.1 测试套件
 
 ```
-环境：C:\Users\86182\anaconda3\envs\agent-runtime\python.exe
+环境：conda env `agent-runtime`（Python 3.11.16）
 命令：python -m pytest tests/ -q --no-header
 结果：exit=2
   ERROR collecting tests/test_api.py
@@ -525,7 +525,7 @@ compressed = [*pinned, summary_msg, *recent]
 | **CI 尚未在 GitHub 上真实运行过** | 本轮只做了本机复刻验证（10/10 通过）。真实 runner 上的首跑结果需 push 后确认 |
 | `integration` job 的 6 条用例 | 本机无 Docker daemon，本轮仍为 skip。CI 上会真正执行（`test_docker_sandbox` 会构建 `agent-sandbox:latest`、`test_postgres_checkpoint` 会拉 `postgres:16-alpine`）。**这是唯一存在首次运行不确定性的 job**；若 runner 上因拉镜像/构建失败而红，可先给它加 `continue-on-error` 观察 |
 | `ruff==0.16.7` 版本锁定 | 取自本机受管 venv 实测通过的版本；未在 PyPI 侧二次确认该版本号长期可用 |
-| 未动 README | README 的「21 个用例」「已完成动作不重复执行」「可被任意 MCP 客户端消费」三处表述仍与实现不符（对应 P1-11），本轮刻意未改，保持 diff 聚焦 |
+| 未动 README | README 的「21 个用例」「已完成动作不重复执行」「可被任意 MCP 客户端消费」三处表述仍与实现不符（对应 P1-11），本轮刻意未改，保持 diff 聚焦。**后已于附四补做** |
 | 附带发现（未修） | ① `metrics.py` 本地实测吞吐 **7.51 tasks/s**（m=10/并发4），与 README 的 **40.3** 差距悬殊，再次印证该数字不可外推；② `demo_cli.py --offline` 的「离线」只覆盖模型不覆盖工具 |
 
 ---
@@ -682,7 +682,7 @@ README 记的是「20 个双步任务、墙钟 0.5s」= 40.3 tasks/s —— 与 
 | CI 仍未在 GitHub 上真实运行过 | 本轮仍只做本机复刻；`integration` job（Docker/PG 6 条）首跑结果待确认 |
 | P1-1 幂等表在 PostgreSQL 上未实测 | 用 SQLite 验证；`UniqueConstraint` 在 PG 语义相同，但无 PG 环境实测 |
 | `metrics.py` 抽样吞吐仍未启用 checkpointer | 属 P1-5（口径修正），本轮未做；已在脚本输出中显式声明 |
-| README 三处表述 | 仍未改（P1-11）。注意：P1-1 完成后，「已完成动作不重复执行」已**有条件成立**，可改写为"流水已提交前提下不重复执行" |
+| README 三处表述 | **已于附四修正（P1-11 完成）**。P1-1 完成后「已完成动作不重复执行」已条件成立，改写为"流水已提交前提下不重复执行"并给出能力边界 |
 
 **未阻塞后续任务**：P1-3（critic 结构化错误分类）、P1-4（退避重试）、P1-5（指标口径）均可独立推进；
 其中 P1-4 与本轮 P1-2 有耦合——退避重试若按 `call_id` 计数，可直接复用本轮引入的 `call_id` 字段。
@@ -785,6 +785,111 @@ CI 全部步骤本机复刻 **10/10**，对抗性 smoke 门禁全过。套件总
 
 **未阻塞后续任务**：P1-3（结构化错误分类）可直接替换 `app/core/retry.py` 的内部实现而**不动调用方**——
 这正是本轮把标记表收口到单一模块的目的。P1-5（指标口径）与 P1-4 无耦合，可并行。
+
+---
+
+# 附四：P1-11 README 口径修正（公开仓库前置，2026-09-19 第四轮）
+
+## N. 为什么要先修再公开
+
+仓库改为**公开**后，招聘官会**同时**看到 `README.md` 与本审计报告。
+README 若继续写「21 个用例」「已完成动作不重复执行」「可被任意 MCP 客户端消费」，
+而本报告白纸黑字写明这三条不成立 —— 那不是"诚实记录"，是**自相矛盾**。
+所以公开前必须先让 README 与实现对齐。
+
+## O. 逐条修正
+
+| 位置 | 原表述 | 现表述 | 依据 |
+|---|---|---|---|
+| 核心功能·中断恢复 | 已完成动作**不重复执行** | 工具执行流水以 `(task_id, call_id)` 为幂等键，重跑节点时**回放已提交结果而非再执行**；并写明覆盖窗口是"工具已返回、流水已提交，但 checkpoint 未提交" | P1-1 的实现边界（附二 F 节） |
+| 核心功能·MCP | 可被**任意 MCP 客户端消费** | 降级为「**描述符格式兼容，非完整接入**」：只有 `tools/list` 形状，**无 MCP 服务端进程（无 stdio/SSE）、无 MCP 客户端** | `mcp_server.py` 至今不存在 |
+| 核心功能·失败重试 | 参数自愈 + critic 三分类 | 补上**退避重试**（`retry_transient` 只读工具）与**自愈配额按单次调用计** | P1-2 / P1-4 |
+| Function Calling / MCP | 合并成一行 | **拆成两行**：Function Calling 标为完整；MCP 单独成行并标注缺口 | 避免用一个词掩盖半成品 |
+| 量化指标 | 吞吐 **40.3 tasks/s**，只写"20 个双步任务、并发 4、墙钟 0.5s" | **≈46 tasks/s**，并把**测量协议**写进表格口径栏；另加四条口径披露：① 协议已在脚本内冻结（`SEARCH_PROVIDER=bing` 时只有 7.47，差 5.9 倍）② 抽样吞吐**未启用 checkpointer**，不代表落盘吞吐 ③ 恢复率用的是**进程内 MemorySaver**，跨进程由 SQLite 用例覆盖 ④ 复测命令 | 附一节 1.5 的指标口径复核 |
+| 演示脚本 | `demo_crash_recovery.py`（**无重复执行**） | 注明该演示断点设在工具执行**之前**，它验证的是"恢复续跑"，**不是幂等去重**；幂等去重由 `tests/test_tool_journal.py` 覆盖 | 附一节 5.2 |
+| 测试 | **21 个用例，全部离线** | **49 个用例：43 条完全离线 + 6 条需 Docker/PG**，并补齐新增覆盖项 | 实测 `43 passed, 6 skipped` |
+| 目录结构 | `tests/ 21 个离线测试` | 49 个（43 离线 + 6 需 Docker/PG）；补 `core/retry.py`、工具执行流水表、`docs/`、`.github/workflows/` | 同上 |
+| 模块对照 | M1–M6「**全部完成**」 | 改为「M1–M6 已落地」+ 列明在 M1–M6 之上补的三层负面路径能力，并**链接本审计文档** | 让两份文档互相印证而非互相打脸 |
+| 新增 | — | **CI 徽章**（`actions/workflows/ci.yml`）+ **质量门禁小节**（四道 job 的内容，含对抗性 `SEARCH_PROVIDER=bing` 注入） | 公开仓库需要可验证信号 |
+| 新增 | — | 面试深挖点从 5 条扩到 9 条，补：恢复到底保证什么（at-least-once vs at-most-once）、重试为何按工具声明开关、自愈与重试的分工、上下文压缩踩过的 O(n²) 坑 | 这四条都是本轮真踩出来的 |
+| 隐私 | `docs/…md:42` 含 `C:\Users\<用户名>\anaconda3\envs\agent-runtime\python.exe` | 改为 `conda env agent-runtime（Python 3.11.16）` | 公开后不应暴露本机用户名 |
+
+## P. 公开发布前的泄露扫描（63 个已跟踪文件）
+
+| 检查项 | 结果 |
+|---|---|
+| 密钥前缀（`sk-` / `ghp_` / `gho_` / `github_pat_` / `AKIA` / `xox*`） | ✅ 0 处 |
+| 私钥头（`BEGIN … PRIVATE KEY`） | ✅ 0 处 |
+| 非空密钥赋值 / 硬编码 Bearer | ✅ 0 处 |
+| 手机号 / 邮箱 | ✅ 0 处 |
+| 本机绝对路径 | 修正前 1 处 → **修正后 0 处** ✅ |
+| 演示凭据（知情项） | `.env.example` 的 `sk-xxx` 是注释占位符；`docker-compose.yml` 的 `agent:agent` 是本地 compose 默认口令，公开属常规 |
+
+## Q. 仍然存在、但已如实写进 README 的限制
+
+- MCP 只有描述符格式（无服务端/客户端）
+- 抽样吞吐未启用 checkpointer；恢复率口径为进程内 MemorySaver
+- PostgreSQL 路径在 CI 上才首次真跑；本机无 Docker daemon，集成用例长期 skip
+- `retry.py` 仍是字符串嗅探的过渡实现（HTTP 5xx / 429 等状态码仍未纳入），P1-3 负责替换
+- 自愈循环内"重跑时抛运行错"未接退避重试
+
+---
+
+# 附五：测试套件封闭性缺陷——公开前复核时发现并修复（2026-09-19 第五轮）
+
+## R. 发现过程
+
+改完 README/文档后复跑全量测试，结果 **8 failed, 35 passed，耗时 88s**（此前 12.5s 全绿）。
+文档改动不可能影响测试，所以先看失败详情——**测试输出里 `settings` 明晃晃写着 `search_provider='bing'`**：
+
+```
+RuntimeError: 必应搜索未解析到结果（页面结构可能已变更）
+  app\tools\web_search.py:52
+```
+
+## S. 根因
+
+`tests/conftest.py` 冻结了模型层（`LLM_MODEL` / `LLM_BASE_URL`）与沙箱/队列，**却没有冻结 `SEARCH_PROVIDER`**。
+它回落到 `.env` 的 `bing`，于是所有用到 `web_search` 的用例都真的去访问 `cn.bing.com`：
+必应当下返回了无法解析的页面 → `_parse_bing` 返回空列表 → 工具（按设计）明确抛错，而不是静默给空结果 →
+8 个用例集体失败。
+
+**这与我在脚本层修的是同一个根因**（"只冻结模型层、不冻结工具层"），只是测试套件里还留着一处，
+前几轮的脚本修复没有覆盖到它。
+
+## T. 必须写下的一处更正
+
+此前几轮报告中"43 passed / 25 passed"的**绿色结果是部分靠运气**——那几次必应恰好可用。
+这不是本轮新引入的回归，而是**一直存在的封闭性缺陷**，被外部服务的偶然可用性掩盖了。
+把它记在这里，比事后让别人发现更好。
+
+## U. 修复与验证
+
+| 改动 | 内容 |
+|---|---|
+| `tests/conftest.py` | 增加 `os.environ["SEARCH_PROVIDER"] = "mock"`（无条件覆写，外部环境变量也压不过它）与退避延迟归零；文件头写明"测试必须封闭"这条铁律及本次事故 |
+| `.github/workflows/ci.yml` | `test` job 增加**对抗性步骤**：注入 `SEARCH_PROVIDER=bing` 再跑一遍离线套件，必须同样全绿 |
+
+**对抗性验证（三次运行，每次约 6.6s）**：
+
+| 场景 | 结果 |
+|---|---|
+| 正常环境（不设该变量 → 会回落 `.env` 的 bing） | ✅ 43 passed, 6 skipped |
+| 注入 `SEARCH_PROVIDER=bing` | ✅ 43 passed, 6 skipped |
+| 注入 `SEARCH_PROVIDER=ddgs`（另一个会出网的 provider） | ✅ 43 passed, 6 skipped |
+
+耗时也从 88s 回到 6.6s —— 那 80 秒全是等必应超时。
+
+**为什么这条对公开仓库尤其重要**：招聘官或任何人 clone 下来跑 `python -m pytest tests/`，
+结果必须只取决于代码，而不是取决于"此刻必应是否可解析"。
+
+## V. 顺带的安全提醒
+
+pytest 失败时会把 `settings` 整个 repr 出来，其中包含 `.env` 里的真实 `LLM_API_KEY`。
+已确认该密钥**只存在于 `.env`**（`.gitignore` 第 3 行已排除），**未进入任何已跟踪文件**（附四 P 节的泄露扫描为 0 命中）。
+但由此得出一条纪律：**不要把测试失败输出直接贴到公开场合**（Issue、聊天、截图）。
+
+
 
 
 

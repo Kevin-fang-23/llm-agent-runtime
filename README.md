@@ -1,5 +1,7 @@
 # LLM Agent Runtime
 
+[![CI](https://github.com/Kevin-fang-23/llm-agent-runtime/actions/workflows/ci.yml/badge.svg)](https://github.com/Kevin-fang-23/llm-agent-runtime/actions/workflows/ci.yml)
+
 > 面向真实业务的可托管 Agent 运行时——用户用自然语言下目标，Agent 自主规划、调用工具（搜索 / 代码执行 / 数据库 / 文件操作）、多步执行并交付结果。类似开源版 Dify 的 mini-Agent 平台。
 
 **姊妹项目定位**：校园多模态助手证明「RAG 流水线」能力（确定性流水线，人是架构设计者）；本项目证明「动态执行系统」能力（模型实时规划执行，我给模型造安全护栏）。工程挑战从"检索准不准"变成"规划对不对、执行安不安全、崩了能不能恢复、成本可不可控"。
@@ -12,10 +14,11 @@
 |---|---|---|
 | 任务分解与规划（双模式可切换） | ReAct / Plan-and-Execute 两个入口路由进同一状态机，critic 判定"计划缺陷"自动回 planner 重规划 | `app/graph/nodes.py` `route_entry` / `critic_node` |
 | 工具注册与沙箱执行 | MCP 风格描述符注册表（name/description/inputSchema）+ JSON Schema 校验；代码执行走 Docker 沙箱（断网/限内存 CPU/只读 FS/非 root） | `app/tools/registry.py`、`app/executor/sandbox.py` |
-| 失败自动重试与反思 | 参数校验失败走自愈循环（错误回喂模型修参，上限 3 次）；运行期错误由 critic 节点分类：retryable→重试 / plan_defect→重规划 / fatal→终止 | `tool_executor_node` / `critic_node` |
+| 失败自动重试与反思 | 参数校验失败走自愈循环（错误回喂模型修参，配额按**单次调用**计，上限 3 次）；运行期**瞬时**错误对声明 `retry_transient` 的只读工具做**指数退避原样重试**；其余运行错由 critic 分类：retryable→回决策 / plan_defect→重规划 / fatal→终止 | `tool_executor_node` / `_retry_transient` / `critic_node` |
 | 执行轨迹可视化 | 每个节点广播事件流落库，Web 时间线实时渲染（规划/思考/工具/自愈/预算/压缩全部可见） | `web/index.html`、`GET /api/tasks/{id}/trace` |
-| 任务中断恢复（checkpoint） | LangGraph checkpointer 落 SQLite/PostgreSQL，进程崩溃后 `ainvoke(None)` 从断点续跑，已完成动作不重复执行 | `app/graph/engine.py` `resume_task` |
-| Function Calling / MCP | 模型侧 OpenAI function calling；工具清单即 MCP `tools/list` 格式（`GET /api/tools`），可被任意 MCP 客户端消费 | `ToolSpec.mcp_descriptor()` |
+| 任务中断恢复（checkpoint） | LangGraph checkpointer 落 SQLite/PostgreSQL，进程崩溃后 `ainvoke(None)` 从断点续跑。**工具执行流水以 `(task_id, call_id)` 为幂等键**：checkpoint 重跑节点时回放已提交结果而非再执行一次（覆盖"工具已返回、流水已提交，但 checkpoint 未提交"的崩溃窗口） | `app/graph/engine.py` `resume_task`、`app/storage/models.py` `ToolExecution` |
+| Function Calling | 模型侧 OpenAI function calling，`tool_calls` 回填 `tool_call_id` 关联 | `app/core/llm.py`、`nodes.py` `_assistant_message` |
+| MCP（**描述符格式兼容，非完整接入**） | 工具清单按 MCP `tools/list` 结构输出（`GET /api/tools`，字段 `name/description/inputSchema`）。⚠️ **目前没有 MCP 服务端进程（无 stdio/SSE 传输），也没有 MCP 客户端去接外部 MCP 工具** —— 只做到"描述符形状一致" | `ToolSpec.mcp_descriptor()` |
 | LangGraph 状态机持久化 | StateGraph 六节点 + 条件边，checkpointer 可插拔（SQLite/PG） | `app/graph/engine.py` `_build` |
 | Docker 沙箱隔离 | network_disabled + mem_limit + nano_cpus + pids_limit + read_only + tmpfs + uid 65534 | `DockerSandbox` |
 | 异步任务队列 | 默认进程内 asyncio 队列（零依赖）；生产切 Celery+Redis（`QUEUE_MODE=celery`） | `app/worker/local_queue.py`、`celery_app.py` |
@@ -25,15 +28,25 @@
 | 并发子 Agent 资源调度 | 任务级信号量（`MAX_CONCURRENT_TASKS`）+ 工具级信号量（`MAX_CONCURRENT_TOOLS`），一轮多工具 asyncio.gather 并行 | `local_queue.py` / `tool_executor_node` |
 | token/步数双维度预算 | 步数或 token 超限→降级便宜模型续跑一次→再超限则带已完成数据优雅终止 | `app/core/budget.py` |
 
-## 二、量化指标（`python scripts/metrics.py` 实测）
+## 二、量化指标（`python scripts/metrics.py --n 10 --m 20` 实测）
 
-| 指标 | 数值 | 说明 |
+| 指标 | 数值 | 口径（引用时必须一并带上） |
 |---|---|---|
-| 断点恢复成功率 | **100%** (n=10) | tool_executor 前打断，新引擎实例恢复至完成 |
+| 断点恢复成功率 | **100%** (n=10) | 在 `tool_executor` **前**打断，换新引擎实例从同一 checkpoint 恢复至完成 |
 | 自愈挽救率 | **100%** (n=10) | 注入非法工具参数，自愈循环修复后完成 |
-| 并发吞吐 | **40.3 tasks/s** | 20 个双步任务、并发 4、墙钟 0.5s（离线假模型） |
+| 并发吞吐 | **≈46 tasks/s** | m=20 个双步任务、并发 4、墙钟 0.43s（本机 Python 3.11.16 / Windows，随机器变化） |
 
-> 指标基于离线脚本化模型（隔离 LLM 波动，测的是运行时本身）；接真实模型后用 `scripts/mock_llm_server.py` 同法可复测。
+> **口径披露**（这几条容易被读歪，所以写清楚）：
+>
+> 1. **测量协议在脚本内冻结**：模型 = 脚本化假模型（隔离 LLM 波动），搜索 = `mock`（不出网）。
+>    不冻结工具层会让同一命令差 **5.9 倍**——`SEARCH_PROVIDER=bing` 实测只有 **7.47 tasks/s**，
+>    因为那时测的是必应 RTT，不是运行时本身。
+> 2. 抽样吞吐**未启用 checkpointer**（纯内存图），**不代表落盘后的端到端吞吐**；脚本输出里也打印了这句话。
+> 3. 恢复率用的是**进程内 MemorySaver + 新引擎实例**（验证 resume 逻辑），
+>    跨引擎/落盘持久化由 `tests/test_checkpoint_resume.py`（SQLite）覆盖。
+> 4. 复测方式：`python scripts/metrics.py`；接真实模型后可换 `scripts/mock_llm_server.py` 同法复测。
+>
+> 更完整的差距评估与后续计划见 [`docs/Agent运行时-差距评估与完善建议.md`](docs/Agent运行时-差距评估与完善建议.md)。
 
 ## 三、快速开始
 
@@ -75,9 +88,24 @@ LLM_BASE_URL=http://127.0.0.1:9100/v1 LLM_API_KEY=mock \
 ### 关键演示脚本
 
 ```bash
-python scripts/demo_crash_recovery.py  # M2：进程崩溃 → 跨进程 checkpoint 恢复（无重复执行）
-python scripts/metrics.py              # 断点恢复率 / 自愈挽救率 / 并发吞吐
+python scripts/demo_crash_recovery.py  # M2：子进程到断点退出 → 新进程从 checkpoint 恢复至完成
+                                      #     注：该演示把断点设在工具执行**之前**，所以它验证的是"恢复续跑"，
+                                      #     不是幂等去重；幂等去重（工具已执行但 checkpoint 未提交，
+                                      #     恢复时不得重复执行）由 tests/test_tool_journal.py 覆盖。
+python scripts/metrics.py              # 断点恢复率 / 自愈挽救率 / 并发吞吐（协议已在脚本内冻结）
+python scripts/demo_cli.py --offline   # 全链路：ReAct → 并行工具 → 沙箱 code_run → 交付（模型与工具均不出网）
 ```
+
+### 质量门禁（CI）
+
+`.github/workflows/ci.yml` 四道门禁，push / PR 均触发：
+
+| Job | 内容 |
+|---|---|
+| `static` | `ruff --select E9,F63,F7,F82`（**F821 未定义名**，专拦"缺 import 导致导入期崩溃"）+ `compileall` + `import app.main` / `import app.worker.celery_app` 冒烟 |
+| `test` | 43 条离线用例，结果与机器无关 |
+| `integration` | Docker 沙箱 4 例（无挂载执行 / 出网被拦 / uid=65534 / 超时被杀）+ PostgreSQL checkpoint 2 例 |
+| `smoke` | CLI 全链路 / 崩溃恢复 / **指标门禁**（恢复率与自愈率断言 100%）；三步均注入敌对 `SEARCH_PROVIDER=bing`，断言脚本仍自报 `mock` —— 防止"离线脚本偷偷联网"复发 |
 
 ## 四、架构
 
@@ -145,10 +173,11 @@ docker compose up --build                        # PG + Redis + API + Celery wor
 ## 七、测试
 
 ```bash
-python -m pytest tests/ -q     # 21 个用例，全部离线
+python -m pytest tests/ -q
+# 49 个用例：43 条完全离线、可确定复现；6 条需 Docker daemon / PostgreSQL（不可用时自动 skip，CI 上会真跑）
 ```
 
-覆盖：ReAct 循环与并行工具、Plan-Execute 与重规划、自愈循环（成功/耗尽降级）、步数与 token 预算（含模型降级）、上下文压缩、checkpoint 跨引擎恢复、工具 Schema/路径越狱/SQL 只读、API 全生命周期。
+覆盖：ReAct 循环与并行工具、Plan-Execute 与重规划、自愈循环（成功 / 耗尽降级 / **配额按调用计** / **并发不互相挤占**）、步数与 token 预算（含模型降级）、上下文压缩、checkpoint 跨引擎恢复、**工具执行流水幂等（真实崩溃窗口 + 对照组）**、**瞬时错误退避重试（闸门 / 上限 / 取消 / 真实等待）**、工具 Schema / 路径越狱 / SQL 只读、子 Agent 委托与递归防护、API 全生命周期、Docker 沙箱隔离、PostgreSQL checkpoint。
 
 ## 八、目录结构
 
@@ -158,20 +187,23 @@ app/
   core/llm.py          LLM 抽象：OpenAI 兼容客户端 + 脚本化假模型
   core/budget.py       token/步数双维度预算（含降级策略）
   core/compressor.py   上下文压缩 + key_outputs 不可压缩注入
+  core/retry.py        瞬时错误判别与指数退避（critic 与自动重试共用的单一判定点）
   graph/state.py       AgentState（状态机单一事实来源）
   graph/nodes.py       六节点：planner/react_step/tool_executor/critic/compressor/finisher
-  graph/engine.py      StateGraph 装配 + run/resume/cancel + 事件广播
-  tools/registry.py    MCP 风格注册表（JSON Schema 校验）
-  tools/*.py           web_search / code_run / db_query / file_ops
+  graph/engine.py      StateGraph 装配 + run/resume/cancel + 事件广播 + ToolJournal 注入点
+  tools/registry.py    MCP 风格注册表（JSON Schema 校验 + retry_transient 声明）
+  tools/*.py           web_search / get_weather / code_run / db_query / file_ops / subagent
   executor/sandbox.py  Docker 沙箱（本地受限子进程回退）
-  storage/             SQLAlchemy 任务表 + 事件表 + 仓储
+  storage/             任务表 + 事件表 + **工具执行流水表（幂等去重）** + 仓储
   worker/              本地 asyncio 队列 + Celery worker
   api/                 FastAPI 路由
   main.py              应用入口（lifespan 组装）
 web/index.html         轨迹可视化（零依赖单页）
 sandbox/Dockerfile     代码执行沙箱镜像（python:3.11-slim 最小化）
 scripts/               CLI 演示 / 崩溃恢复演示 / 指标脚本 / Mock LLM / 种子库
-tests/                 21 个离线测试
+tests/                 49 个测试（43 离线 + 6 需 Docker/PG）
+docs/                  目标差距评估与 P0/P1 修复记录
+.github/workflows/     CI 四道门禁
 ```
 
 ## 九、面试深挖点（对应设计决策）
@@ -181,7 +213,15 @@ tests/                 21 个离线测试
 3. **自愈循环的边界**：错误回喂只能修"参数格式错"，修不了"工具没这能力"——所以自愈 3 次耗尽后 critic 判定为 plan_defect 回 planner，而不是无限重试。
 4. **上下文压缩不丢关键状态**：摘要必然有损，所以关键工具输出在产生时即复制进 `key_outputs`（截断快照），每步注入 system——压缩只作用于"过程消息"，事实数据不走摘要。
 5. **取消为什么是协作式**：强杀线程/任务会丢状态；在节点边界检查取消标志，状态照常落 checkpoint，取消本身也可追溯。
+6. **"恢复不重复执行"到底保证什么**：checkpoint 落在 superstep 边界，节点内动作是 at-least-once。at-most-once 需要以 `(task_id, call_id)` 为幂等键的**工具执行流水表**——覆盖的是"工具已返回、流水已提交，但 checkpoint 尚未提交"这个崩溃窗口。工具执行**中途**崩溃（流水还没写）拦不住，那需要工具侧提供幂等键，属远程服务的责任。
+7. **为什么重试要按工具声明开关**：超时不等于失败，工具可能**已经产生了副作用**，盲目重试会把它做两遍。所以只有只读/天然幂等的工具声明 `retry_transient`（web_search / get_weather / db_query），写类与有副作用类（file_ops 的 write / code_run / subagent）一律关闭。
+8. **自愈与重试的分工**：自愈修"参数错"（改参数后重跑），退避重试处理"运行错"（参数一字不改）。两者都有限次，用尽后的升级阶梯是"观测值带错误 → critic 分类 → 回 `react_step` 交模型决策"，**不在工具层无限重试**。
+9. **上下文压缩踩过的坑**：早期把每轮现构造的 system / 任务提示也写回了历史，于是上一轮拼进去的"输入"在下一轮变成了"历史"，上下文随步数近似 **O(n²)** 膨胀（实测第 5 次 LLM 调用收到的 token 是第 1 次的 26 倍），并连带打穿压缩器（它的切片假设 system 只出现在头部）。修法是把"每轮重建的输入"与"执行历史"拆成两条通道，只把 assistant 决策追加进历史。
 
 ## 十、与需求文档的模块对照
 
-M1 执行内核（`demo_cli.py`）→ M2 状态持久化（`demo_crash_recovery.py` + 恢复率 100%）→ M3 沙箱与自愈（`sandbox.py` + 自愈挽救率 100%）→ M4 异步并发（双队列 + 吞吐 40.3 tasks/s）→ M5 成本预算（双维度 + 降级）→ M6 观测产品化（事件流 + Web 时间线）。全部完成。
+M1 执行内核（`demo_cli.py`）→ M2 状态持久化（`demo_crash_recovery.py`）→ M3 沙箱与自愈（`sandbox.py`）→ M4 异步并发（双队列）→ M5 成本预算（双维度 + 降级）→ M6 观测产品化（事件流 + Web 时间线）。**M1–M6 已全部落地**。
+
+在 M1–M6 之上又补了三层"负面路径"能力：**工具执行流水幂等**（恢复不重复执行）、**瞬时错误指数退避重试**（只对声明 `retry_transient` 的只读工具）、**自愈配额按调用计 + 并发安全**。
+
+各模块的差距评估、优先级路线图与逐项修复记录见 [`docs/Agent运行时-差距评估与完善建议.md`](docs/Agent运行时-差距评估与完善建议.md)。
