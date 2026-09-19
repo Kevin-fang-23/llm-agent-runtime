@@ -7,7 +7,7 @@ from __future__ import annotations
 
 import time
 
-from sqlalchemy import Boolean, Float, Integer, String, Text, UniqueConstraint
+from sqlalchemy import Boolean, Float, Index, Integer, String, Text, UniqueConstraint
 from sqlalchemy.ext.asyncio import AsyncAttrs, async_sessionmaker, create_async_engine
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 
@@ -41,10 +41,17 @@ class Task(Base):
 
 
 class Event(Base):
+    """轨迹事件。
+
+    `(task_id, seq)` 复合索引：轨迹查询与增量推送都是「按任务取 seq 之后的一段」，
+    单列索引要先扫出该任务全部事件再过滤；复合索引让这段查询直接走范围扫描。
+    """
+
     __tablename__ = "events"
+    __table_args__ = (Index("ix_events_task_seq", "task_id", "seq"),)
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
-    task_id: Mapped[str] = mapped_column(String(40), index=True)
+    task_id: Mapped[str] = mapped_column(String(40))
     seq: Mapped[int] = mapped_column(Integer)
     type: Mapped[str] = mapped_column(String(40))
     payload: Mapped[str] = mapped_column(Text, default="{}")

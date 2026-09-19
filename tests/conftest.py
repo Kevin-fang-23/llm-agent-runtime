@@ -62,6 +62,32 @@ def registry(settings):
     return build_default_registry(settings)
 
 
+@pytest.fixture()
+def client(settings, registry):
+    """API 客户端：走 app 的真实 lifespan（建表 / 真实注册表 / 本地队列），只换掉 LLM 引擎。
+
+    放在 conftest 而不是某个测试模块里：API 端到端不止一个模块要用（轨迹 / 导出 / SSE…）。
+    """
+    from fastapi.testclient import TestClient
+    from langgraph.checkpoint.memory import MemorySaver
+
+    from app.main import app
+
+    with TestClient(app) as c:
+        script = [
+            {"thought": "搜索", "tool": {"name": "web_search", "arguments": {"query": "北京 天气"}}},
+            {"final": "API 端到端完成：北京晴。"},
+        ]
+        # journal 也接上：让夹具与生产接线一致（main.py 的 lifespan 就是这么装的），
+        # 否则"工具执行流水是否真的接进引擎"这条装配检查会被夹具本身掩盖。
+        engine, _ = make_engine(settings, script, c.app.state.registry, saver=MemorySaver(),
+                                event_sink=lambda e: c.app.state.repo.append_event(e),
+                                journal=c.app.state.repo)
+        c.app.state.engine_holder.engine = engine
+        yield c
+        c.app.state.engine_holder.engine = None
+
+
 def make_engine(settings, script: list[dict], registry, saver=None, event_sink=None,
                 interrupt_before: list[str] | None = None,
                 journal=None) -> tuple[AgentEngine, FakeScriptedLLM]:

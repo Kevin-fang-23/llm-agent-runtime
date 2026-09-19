@@ -67,6 +67,17 @@
   .plan-chip { display: inline-block; background: var(--panel2); border: 1px solid var(--border); border-radius: 6px; padding: 4px 10px; margin: 3px 4px 0 0; font-size: 12px; }
   .plan-chip.done { border-color: var(--green); color: var(--green); }
   .plan-chip.pending { color: var(--muted); }
+  .plan-chip.warn { border-color: var(--yellow); color: var(--yellow); }
+  /* 预算进度条（token / 步数双维度） */
+  .bar-wrap { display: grid; grid-template-columns: 150px 1fr; align-items: center; gap: 10px; margin: 4px 0; }
+  .bar-label { font-size: 11px; color: var(--muted); }
+  .bar { height: 7px; background: var(--panel2); border-radius: 4px; overflow: hidden; }
+  .bar > i { display: block; height: 100%; background: linear-gradient(90deg, var(--accent), var(--green)); }
+  /* 事件参数/结果可折叠 */
+  .ev-more { grid-column: 3; margin-top: 4px; }
+  .ev-more summary { cursor: pointer; color: var(--accent); font-size: 11px; }
+  .ev-more pre { background: var(--panel2); border: 1px solid var(--border); border-radius: 6px;
+                 padding: 8px; margin: 6px 0 0; font-size: 11px; white-space: pre-wrap; word-break: break-all; }
 </style>
 </head>
 <body>
@@ -96,10 +107,13 @@
       <div class="goal-box">
         <div class="label">任务目标 · <span id="d-id"></span> · <span id="d-meta"></span></div>
         <div id="d-goal"></div>
+        <div id="d-bars" style="margin-top:8px"></div>
         <div id="d-plan" style="margin-top:8px"></div>
         <div class="actions">
           <button class="ghost" onclick="resumeTask()">从断点恢复</button>
           <button class="ghost" onclick="cancelTask()">取消任务</button>
+          <button class="ghost" onclick="exportTrace('json')">导出 JSON</button>
+          <button class="ghost" onclick="exportTrace('md')">导出 Markdown</button>
         </div>
       </div>
       <div id="result" style="display:none"><div class="label">交付结果</div><div id="d-result"></div></div>
@@ -168,53 +182,100 @@ async function selectTask(id) {
   document.getElementById('detail').style.display = 'none';
   document.getElementById('detail-body').style.display = 'block';
   document.querySelectorAll('.task-item').forEach(n => n.classList.remove('active'));
-  clearInterval(pollTimer);
+  clearInterval(pollTimer); pollTimer = null;
+  closeStream();
   try {
     await refreshDetail();
-    await pollEvents();
-    pollTimer = setInterval(async () => { await refreshDetail(); await pollEvents(); }, 1500);
+    openStream();          // SSE：事件与任务快照都走推送，不再 1.5s 轮询
   } catch (e) {
     toast('加载任务详情失败：' + e.message, true);
   }
 }
 
+let es = null;
+function closeStream() { if (es) { es.close(); es = null; } }
+function openStream() {
+  if (!currentId || es) return;
+  es = new EventSource(`/api/tasks/${currentId}/stream`);
+  es.addEventListener('task', ev => { try { renderTask(JSON.parse(ev.data)); } catch (_) {} });
+  es.addEventListener('stream_end', () => { closeStream(); refreshDetail(); });
+  // 其余事件按类型名注册：与后端 emit 的事件名一一对应
+  for (const t of ['llm_step','tool_result','tool_error','tool_replay','tool_retry_scheduled',
+                   'tool_retry_success','tool_retry_exhausted','tool_validation_failed',
+                   'selfheal_success','plan_created','step_done','replan','critic','compress',
+                   'budget_downgrade','budget_exceeded','task_done','task_failed','task_canceled',
+                   'subagent_event']) {
+    es.addEventListener(t, ev => {
+      try { const e = JSON.parse(ev.data); appendEvent(e); } catch (_) {}
+    });
+  }
+  es.onerror = () => { closeStream(); };
+}
+
+const TERMINAL = ['done', 'failed', 'canceled', 'budget_exceeded'];
+
 async function refreshDetail() {
   if (!currentId) return;
   const t = await api(`/api/tasks/${currentId}`);
-  const tasks = await refreshList();
+  await refreshList();
+  renderTask(t);
+}
+
+function renderTask(t) {
   document.getElementById('d-id').textContent = t.id;
   document.getElementById('d-goal').textContent = t.goal;
   document.getElementById('d-meta').textContent =
     `${t.mode} · ${t.status} · ${t.tokens_used} tokens · ${t.steps_used} 步 · 自愈 ${t.selfheal_count} 次 · ${t.duration_s}s`;
-  const terminal = ['done', 'failed', 'canceled', 'budget_exceeded'].includes(t.status);
-  const plan = (!terminal && t.checkpoint_next && t.checkpoint_next.length) ? `断点位置：${t.checkpoint_next.join(', ')}` : '';
-  document.getElementById('d-plan').innerHTML = plan ? `<span class="plan-chip">${plan}</span>` : '';
-  if (t.result) {
-    document.getElementById('result').style.display = 'block';
-    document.getElementById('d-result').textContent = t.result;
-  } else if (t.error) {
-    document.getElementById('result').style.display = 'block';
-    document.getElementById('d-result').textContent = '错误：' + t.error;
-  } else {
-    document.getElementById('result').style.display = 'none';
+
+  // 预算进度条：token 与步数双维度（与后端双维预算对应）
+  const pct = (a, b) => (b ? Math.min(100, Math.round(a / b * 100)) : 0);
+  document.getElementById('d-bars').innerHTML = `
+    <div class="bar-wrap"><span class="bar-label">token ${t.tokens_used}/${t.max_tokens}</span>
+      <div class="bar"><i style="width:${pct(t.tokens_used, t.max_tokens)}%"></i></div></div>
+    <div class="bar-wrap"><span class="bar-label">步数 ${t.steps_used}/${t.max_steps}</span>
+      <div class="bar"><i style="width:${pct(t.steps_used, t.max_steps)}%"></i></div></div>`;
+
+  const terminal = TERMINAL.includes(t.status);
+  const chips = [];
+  if (t.downgraded) chips.push('<span class="plan-chip warn">已降级</span>');
+  if (t.selfheal_count) chips.push(`<span class="plan-chip">自愈 ${t.selfheal_count} 次</span>`);
+  if (!terminal && t.checkpoint_next && t.checkpoint_next.length) {
+    chips.push(`<span class="plan-chip">断点：${esc(t.checkpoint_next.join(', '))}</span>`);
   }
-  if (['done','failed','canceled','budget_exceeded'].includes(t.status)) {
-    clearInterval(pollTimer); pollTimer = null;
-  }
+  document.getElementById('d-plan').innerHTML = chips.join('');
+
+  const box = document.getElementById('result');
+  if (t.result) { box.style.display = 'block'; document.getElementById('d-result').textContent = t.result; }
+  else if (t.error) { box.style.display = 'block'; document.getElementById('d-result').textContent = '错误：' + t.error; }
+  else { box.style.display = 'none'; }
+
+  if (terminal) { clearInterval(pollTimer); pollTimer = null; }
 }
 
-async function pollEvents() {
-  if (!currentId) return;
-  const data = await api(`/api/tasks/${currentId}/events?after=${lastSeq}`);
+function appendEvent(e) {
   const el = document.getElementById('events');
-  for (const e of data.events) {
-    const div = document.createElement('div');
-    div.className = `ev t-${e.type}`;
-    div.innerHTML = `<span class="seq">#${e.seq}</span><span class="type">${e.type}</span><span class="body">${esc(evPayload(e)).slice(0, 600)}</span>`;
-    el.appendChild(div);
-  }
-  lastSeq = data.last_seq;
-  el.parentElement.scrollIntoView && window.scrollTo(0, document.body.scrollHeight);
+  const div = document.createElement('div');
+  div.className = `ev t-${e.type}`;
+  const payload = evPayload(e);
+  div.innerHTML =
+    `<span class="seq">#${e.seq}</span><span class="type">${e.type}</span>` +
+    `<span class="body">${esc(payload).slice(0, 220)}</span>` +
+    (payload.length > 220 ? `<details class="ev-more"><summary>展开完整参数/结果</summary>` +
+      `<pre>${esc(payload)}</pre></details>` : '');
+  el.appendChild(div);
+  lastSeq = Math.max(lastSeq, e.seq || 0);
+}
+
+async function exportTrace(format) {
+  if (!currentId) return;
+  const res = await fetch(`/api/tasks/${currentId}/export?format=${format}`);
+  const text = await res.text();
+  const blob = new Blob([text], { type: format === 'md' ? 'text/markdown' : 'application/json' });
+  const a = document.createElement('a');
+  a.href = URL.createObjectURL(blob);
+  a.download = `trace-${currentId}.${format}`;
+  a.click();
+  URL.revokeObjectURL(a.href);
 }
 
 async function resumeTask() {
