@@ -14,7 +14,7 @@
 |---|---|---|
 | 任务分解与规划（双模式可切换） | ReAct / Plan-and-Execute 两个入口路由进同一状态机，critic 判定"计划缺陷"自动回 planner 重规划 | `app/graph/nodes.py` `route_entry` / `critic_node` |
 | 工具注册与沙箱执行 | MCP 风格描述符注册表（name/description/inputSchema）+ JSON Schema 校验；代码执行走 Docker 沙箱（断网/限内存 CPU/只读 FS/非 root） | `app/tools/registry.py`、`app/executor/sandbox.py` |
-| 失败自动重试与反思 | 参数校验失败走自愈循环（错误回喂模型修参，配额按**单次调用**计，上限 3 次）；运行期**瞬时**错误对声明 `retry_transient` 的只读工具做**指数退避原样重试**；其余运行错由 critic 分类：retryable→回决策 / plan_defect→重规划 / fatal→终止 | `tool_executor_node` / `_retry_transient` / `critic_node` |
+| 失败自动重试与反思 | **结构化错误码**（timeout / network / rate_limited / upstream_5xx / auth / permission / not_found / invalid_args）驱动分类，不再依赖中文字符串嗅探；参数校验失败走自愈循环（配额按**单次调用**计）；运行期**瞬时**错误对声明 `retry_transient` 的只读工具做**指数退避原样重试**，上游给了 `Retry-After` 就**优先听它**；其余由 critic 按码分流：retryable→回决策 / plan_defect→重规划 / fatal→终止 | `app/core/errors.py` / `app/core/retry.py` / `_retry_transient` / `_classify_failure` |
 | 执行轨迹可视化 | 每个节点广播事件流落库，Web 时间线实时渲染（规划/思考/工具/自愈/预算/压缩全部可见） | `web/index.html`、`GET /api/tasks/{id}/trace` |
 | 任务中断恢复（checkpoint） | LangGraph checkpointer 落 SQLite/PostgreSQL，进程崩溃后 `ainvoke(None)` 从断点续跑。**工具执行流水以 `(task_id, call_id)` 为幂等键**：checkpoint 重跑节点时回放已提交结果而非再执行一次（覆盖"工具已返回、流水已提交，但 checkpoint 未提交"的崩溃窗口） | `app/graph/engine.py` `resume_task`、`app/storage/models.py` `ToolExecution` |
 | Function Calling | 模型侧 OpenAI function calling，`tool_calls` 回填 `tool_call_id` 关联 | `app/core/llm.py`、`nodes.py` `_assistant_message` |
@@ -28,23 +28,26 @@
 | 并发子 Agent 资源调度 | 任务级信号量（`MAX_CONCURRENT_TASKS`）+ 工具级信号量（`MAX_CONCURRENT_TOOLS`），一轮多工具 asyncio.gather 并行 | `local_queue.py` / `tool_executor_node` |
 | token/步数双维度预算 | 步数或 token 超限→降级便宜模型续跑一次→再超限则带已完成数据优雅终止 | `app/core/budget.py` |
 
-## 二、量化指标（`python scripts/metrics.py --n 10 --m 20` 实测）
+## 二、量化指标（`python scripts/metrics.py` 实测）
 
 | 指标 | 数值 | 口径（引用时必须一并带上） |
 |---|---|---|
-| 断点恢复成功率 | **100%** (n=10) | 在 `tool_executor` **前**打断，换新引擎实例从同一 checkpoint 恢复至完成 |
+| 断点恢复成功率 | **100%** (n=10) | 磁盘 checkpoint（SQLite），在 `tool_executor` **前**打断 → **关闭连接后换全新连接**恢复至完成 |
+| 崩溃恢复成功率 | **100%** (n=5) | 子进程在**工具执行中途**被硬杀（POSIX=SIGKILL / Windows=TerminateProcess），换进程用同一 checkpoint 库恢复至完成 |
 | 自愈挽救率 | **100%** (n=10) | 注入非法工具参数，自愈循环修复后完成 |
-| 并发吞吐 | **≈46 tasks/s** | m=20 个双步任务、并发 4、墙钟 0.43s（本机 Python 3.11.16 / Windows，随机器变化） |
+| 并发吞吐 | **≈21 tasks/s** | m=20 个双步任务、并发 4、墙钟 0.94s，**含 SQLite checkpoint 落盘**（本机 Python 3.11 / Windows，随机器变化） |
 
 > **口径披露**（这几条容易被读歪，所以写清楚）：
 >
 > 1. **测量协议在脚本内冻结**：模型 = 脚本化假模型（隔离 LLM 波动），搜索 = `mock`（不出网）。
 >    不冻结工具层会让同一命令差 **5.9 倍**——`SEARCH_PROVIDER=bing` 实测只有 **7.47 tasks/s**，
 >    因为那时测的是必应 RTT，不是运行时本身。
-> 2. 抽样吞吐**未启用 checkpointer**（纯内存图），**不代表落盘后的端到端吞吐**；脚本输出里也打印了这句话。
-> 3. 恢复率用的是**进程内 MemorySaver + 新引擎实例**（验证 resume 逻辑），
->    跨引擎/落盘持久化由 `tests/test_checkpoint_resume.py`（SQLite）覆盖。
-> 4. 复测方式：`python scripts/metrics.py`；接真实模型后可换 `scripts/mock_llm_server.py` 同法复测。
+> 2. 吞吐**已开启 checkpointer**，数字包含持久化开销。先前版本的「≈46 tasks/s」是绕过落盘的
+>    纯内存图测出来的，**不可与当前数字直接比较**：SQLite 会把并发写串行化，这是真实瓶颈，
+>    把瓶颈测出来才是这个指标的意义。
+> 3. 「崩溃恢复」是真的硬杀进程，而不是"跑到断点后干净退出"——后者不给 flush 压力，测不出真实召回能力。
+> 4. 复测：`python scripts/metrics.py [--n 10] [--m 20] [--k 5]`（`--k` 会起子进程，略慢）；
+>    接真实模型后可换 `scripts/mock_llm_server.py` 同法复测。
 >
 > 更完整的差距评估与后续计划见 [`docs/Agent运行时-差距评估与完善建议.md`](docs/Agent运行时-差距评估与完善建议.md)。
 
@@ -92,7 +95,7 @@ python scripts/demo_crash_recovery.py  # M2：子进程到断点退出 → 新�
                                       #     注：该演示把断点设在工具执行**之前**，所以它验证的是"恢复续跑"，
                                       #     不是幂等去重；幂等去重（工具已执行但 checkpoint 未提交，
                                       #     恢复时不得重复执行）由 tests/test_tool_journal.py 覆盖。
-python scripts/metrics.py              # 断点恢复率 / 自愈挽救率 / 并发吞吐（协议已在脚本内冻结）
+python scripts/metrics.py              # 四项：断点恢复 / 崩溃恢复（硬杀）/ 自愈挽救 / 并发吞吐（协议已在脚本内冻结）
 python scripts/demo_cli.py --offline   # 全链路：ReAct → 并行工具 → 沙箱 code_run → 交付（模型与工具均不出网）
 ```
 
@@ -217,6 +220,8 @@ docs/                  目标差距评估与 P0/P1 修复记录
 7. **为什么重试要按工具声明开关**：超时不等于失败，工具可能**已经产生了副作用**，盲目重试会把它做两遍。所以只有只读/天然幂等的工具声明 `retry_transient`（web_search / get_weather / db_query），写类与有副作用类（file_ops 的 write / code_run / subagent）一律关闭。
 8. **自愈与重试的分工**：自愈修"参数错"（改参数后重跑），退避重试处理"运行错"（参数一字不改）。两者都有限次，用尽后的升级阶梯是"观测值带错误 → critic 分类 → 回 `react_step` 交模型决策"，**不在工具层无限重试**。
 9. **上下文压缩踩过的坑**：早期把每轮现构造的 system / 任务提示也写回了历史，于是上一轮拼进去的"输入"在下一轮变成了"历史"，上下文随步数近似 **O(n²)** 膨胀（实测第 5 次 LLM 调用收到的 token 是第 1 次的 26 倍），并连带打穿压缩器（它的切片假设 system 只出现在头部）。修法是把"每轮重建的输入"与"执行历史"拆成两条通道，只把 assistant 决策追加进历史。
+10. **错误分类为什么必须结构化**：最初用中文关键词嗅探（`"超时" in errors`）。它有两个硬伤——改一句文案就失效；而且 `httpx` 的超时文案是 `timed out`，与标记 `timeout` **并不匹配**，这整类错误被静默判成"不可重试"。改成错误码后，"该不该重试"变成可枚举、可表驱动测试的问题，并顺带补齐了 `Retry-After` 优先、HTTP 5xx/429/404 分流这些文本嗅探覆盖不到的场景。
+11. **指标口径要能自证**：同一个 `metrics.py`，搜索源没冻结时实测 **7.47 tasks/s**，冻结后 **43.7**（差 5.9 倍）；吞吐绕过 checkpointer 时是 **46**，开启落盘后 **21.3**。结论是**数字必须自带协议与口径**，否则它测的可能是别的东西（必应 RTT、纯内存图）。
 
 ## 十、与需求文档的模块对照
 

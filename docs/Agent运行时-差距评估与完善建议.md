@@ -961,6 +961,102 @@ ERROR  tests/test_api.py::test_metrics_endpoint / test_validation_error
 **仍未验证**：这两处修复尚未在真实 runner 上跑过（需再推一次）。`integration` job 已在真机上
 通过一次，但它无法覆盖本次改动，仍需重跑确认全绿。
 
+---
+
+# 附七：P1-3 结构化错误码 + P1-5 指标口径修正（2026-09-19 第七轮）
+
+## AA. 前置：CI run #2 全绿
+
+第二轮推送（HEAD `223b539`）四个 job 全部 success：静态检查 26s / 单元测试 27s（含注入
+`SEARCH_PROVIDER=bing` 的对抗性步骤）/ 端到端冒烟 27s / Docker 沙箱 + PostgreSQL 集成 38s。
+CI 门禁由此成立，P1-3/P1-5 才动手。
+
+## AB. P1-3：错误分类从"猜文本"改为"读错误码"
+
+**问题**：原先用中文关键词嗅探（`"超时" in errors`）。两个硬伤：
+1. 改一句文案就失效；
+2. **`httpx` 的超时文案是 `timed out`，与标记 `timeout` 并不匹配** —— 这整类超时错误
+   被静默判定为"不可重试"，而它恰恰是最典型的瞬时故障。
+
+**改动**：
+
+| 文件 | 内容 |
+|---|---|
+| `app/core/errors.py`（**新增**） | `ToolErrorCode`（StrEnum，10 个码）+ `RETRYABLE_BY_CODE` 可重试性表 + `code_from_http_status` + `UpstreamHTTPError` + `parse_retry_after` |
+| `app/tools/registry.py` | `ToolExecutionError(message, code=, retryable=, retry_after_s=)`；**异常类型 → 错误码的集中映射**（PermissionError→PERMISSION、FileNotFoundError→NOT_FOUND、ConnectionError→NETWORK、TimeoutError→TIMEOUT、ValueError→INVALID_ARGS）；`UpstreamHTTPError` 折算成码并透传 Retry-After |
+| `app/core/retry.py` | `is_transient_error`（解析顺序：显式 retryable → 结构化 code → 文本兜底）、`retry_delay_hint`（Retry-After 优先） |
+| `app/graph/nodes.py` | 观测值 / `tool_error` 事件 / 模型可见的工具消息**都带 `error_code`**；`_classify_failure` 按码分流；重试延迟优先取 Retry-After |
+| `app/tools/web_search.py` · `weather.py` | 上游 HTTP 状态码与 httpx 超时/连接异常结构化成码 |
+| `app/tools/subagent.py` | 显式 `retryable=False`：重试一次等于重跑整棵子执行树 |
+
+**兼容策略（不是破坏性迁移）**：`code` 默认 `None`，此时退回原文本启发式。
+所以未标注错误码的抛错点行为**完全不变**；标注了的则精确判定。
+
+**迁移中踩到并修掉的两个坑（都值得写下来）**：
+
+1. **`class X(str, Enum)` 的隐蔽陷阱**：Python 3.11 下 `str(member)` 得到
+   `"ToolErrorCode.TIMEOUT"`，且枚举的 `__hash__` 基于**成员名**而非值。观测值会随 checkpoint
+   持久化，反序列化后退回**普通字符串**——此时 `codes & {枚举成员}` 的集合交集会**静默失配**，
+   critic 会悄悄退化成文本兜底（不报错、不崩溃，只是判定变糊）。
+   处置：改用 `StrEnum`（`str(x)` 即值、哈希与字符串一致），并让观测值**一律存字符串**。
+2. **我漏删了一行旧 `return None, last_err`**，被 CI 的 `ruff --select E9,F63,F7,F82` 里的
+   **F821 未定义名**当场拦下 —— 这条门禁的价值第二次被验证（上一次是它拦住了缺 import 的 P0）。
+
+**验证**：新增 `tests/test_error_codes.py` **59 条**（参数化后），四层覆盖：
+① 枚举完整性**全枚举**（含"每个码都必须有 critic 判定"，禁抽样）、HTTP 状态码 12 组表驱动、
+Retry-After 解析 8 组；② 判定顺序 11 组（含"显式 retryable 双向覆盖结构化默认值"）+ 文本兜底 7 组；
+③ 真实 registry 折叠各类异常（含超时、5xx/429/404/401、未知工具）；④ 端到端：错误码进事件与工具消息、
+PERMISSION→fatal 终止、Retry-After 压过 base=5s 的退避（实测 elapsed < 1s）。
+
+全量：43 → **102 passed, 6 skipped**；敌对条件（`DATABASE_URL` 指向不存在目录 + `SEARCH_PROVIDER=bing`）同样 102 passed。
+
+## AC. P1-5：指标口径修正 —— 让数字测的是它声称的东西
+
+**问题**：三项指标都"虚高"，因为它们绕过了被声称要测的对象：
+
+| 指标 | 旧口径的问题 |
+|---|---|
+| 断点恢复成功率 | 用**进程内 MemorySaver**，两个引擎共享同一个内存对象 —— 完全没有覆盖"状态落盘" |
+| 并发吞吐 | `make_engine` 不传 saver → `checkpointer=None` → **完全绕过写盘** |
+| 崩溃恢复 | 只有 `demo_crash_recovery.py`，而它是"跑到断点后**干净退出**"，不给 flush 压力 |
+
+**改动**：
+
+| 指标 | 新口径 |
+|---|---|
+| 断点恢复成功率 | 每个样本独立 SQLite 文件；打断后**关闭连接**，再用**全新连接**恢复至完成 |
+| **崩溃恢复成功率（新增）** | 子进程进入工具执行后长睡并打标记，父进程**硬杀**它（POSIX=SIGKILL / Windows=TerminateProcess），再用同一 checkpoint 换进程恢复至完成 |
+| 并发吞吐 | **开启 SQLite checkpoint**，共享一个 saver（与生产 `EngineHolder` 同形态） |
+
+**实测（协议：模型=假模型 搜索=mock checkpointer=sqlite / Python 3.11 / Windows）**：
+
+| 指标 | 数值 |
+|---|---|
+| 断点恢复成功率（磁盘 checkpoint，换连接） | **100%** (n=10) |
+| 崩溃恢复成功率（工具执行中被硬杀） | **100%** (n=5) |
+| 自愈挽救率 | **100%** (n=10) |
+| 并发吞吐（含 SQLite checkpoint 落盘） | **≈21 tasks/s** (m=20, 并发 4, 墙钟 0.94s) |
+
+**最重要的结论**：吞吐从「46（绕过落盘）」降到「21（含落盘）」——
+**旧数字不是"更快"，而是测了别的东西**。SQLite 会把并发写串行化，这是端到端真实瓶颈；
+把瓶颈如实测出来，才是指标的意义所在。README 已同步，并明确标注两个数字**不可直接比较**。
+
+**同步改动**：CI 指标门禁从 2 项扩到**四项 + 协议断言**（`搜索=mock`、`checkpointer=sqlite`）；
+grep 由固定空格数改为 `.*100%`，避免标签格式变化成为脆点。
+
+## AD. 本轮总账与未验证项
+
+| 项 | 结果 |
+|---|---|
+| 测试套件 | **102 passed, 6 skipped**（43 → 102，新增 59 条错误码用例） |
+| 静态检查 | `ruff`(E9/F63/F7/F82) clean（并当场拦下我的一处 F821 残码） |
+| CI 步骤本机复刻 | **11/11 通过**（含四项指标门禁） |
+| 敌对条件 | 无 `data/` 目录 + `SEARCH_PROVIDER=bing` → 102 passed |
+
+**未验证**：本轮改动**尚未在真实 runner 上跑过**，需再推一次触发 CI #3。
+`integration` job 会重跑（Docker 沙箱 + PostgreSQL），预计仍应通过。
+
+
 
 
 
