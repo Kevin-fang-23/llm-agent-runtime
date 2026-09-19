@@ -99,6 +99,18 @@ jobs:
             --ignore=tests/test_docker_sandbox.py \
             --ignore=tests/test_postgres_checkpoint.py
 
+      # 对抗性门禁：注入敌对 provider，证明套件真的封闭（不依赖 .env 的 SEARCH_PROVIDER）。
+      # 曾发生过的事故：conftest 只冻结了模型层，SEARCH_PROVIDER 回落到 .env 的 bing，
+      # 于是 web_search 真的访问 cn.bing.com；某次必应返回无法解析的页面，
+      # 8 个用例集体失败 —— 同一份代码在必应可用时却是绿的。
+      - name: pytest（注入 SEARCH_PROVIDER=bing，必须同样全绿）
+        env:
+          SEARCH_PROVIDER: bing
+        run: |
+          python -m pytest tests/ -q --no-header \
+            --ignore=tests/test_docker_sandbox.py \
+            --ignore=tests/test_postgres_checkpoint.py
+
   # ── 门禁 3：集成测试（需要 Docker daemon，ubuntu runner 自带） ─────
   # 这两组用例在本地无 Docker 环境时会被 pytest.skip，所以长期没有被真正执行过。
   # 放到 CI 上跑，是「沙箱隔离」与「PostgreSQL checkpoint」两个卖点的唯一实测来源：
