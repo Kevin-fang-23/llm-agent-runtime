@@ -889,6 +889,79 @@ pytest 失败时会把 `settings` 整个 repr 出来，其中包含 `.env` 里�
 已确认该密钥**只存在于 `.env`**（`.gitignore` 第 3 行已排除），**未进入任何已跟踪文件**（附四 P 节的泄露扫描为 0 命中）。
 但由此得出一条纪律：**不要把测试失败输出直接贴到公开场合**（Issue、聊天、截图）。
 
+---
+
+# 附六：首轮真实 CI 运行结果与修复（2026-09-19 第六轮）
+
+## W. 首次真实运行：4 个 job 里 3 个通过
+
+仓库 `Kevin-fang-23/llm-agent-runtime` 公开后第一次推送（HEAD `1c0f763`，run #1）触发：
+
+| Job | 结果 | 用时 | 说明 |
+|---|---|---|---|
+| `static` 静态检查 | ✅ success | 35s | ruff F821 门禁 / compileall / 双入口导入冒烟 全过 |
+| **`integration` Docker 沙箱 + PostgreSQL checkpoint** | ✅ **success** | 41s | **本机无 Docker daemon，这 6 条用例从项目诞生起一直是被 skip 的**；首次真跑即通过 |
+| `smoke` 端到端冒烟 | ✅ success | 28s | CLI 全链路 / 崩溃恢复 / 指标门禁（恢复率与自愈率 100%）全过 |
+| `test` 单元测试 | ❌ failure | 8s | 见下 |
+
+**这条结论的价值**：沙箱隔离（无挂载执行 / 出网被拦 / uid=65534 / 超时被杀）与 PostgreSQL
+checkpoint（asyncpg + psycopg 双通道、重连落盘）**从"代码里写了"变成"CI 可验证"**。
+附一报告中把这两项列为"未验证项"，现在可以销账。
+
+## X. `test` job 失败的根因（已复现、已修）
+
+**现象**：仅该 job 失败、耗时 8 秒、失败集中在 `tests/test_api.py` 一组；本地 Windows 全绿。
+
+**为什么本地绿、CI 红**——两层叠加：
+
+1. `tests/conftest.py` 的 `settings` fixture 把 `TOOL_DB_PATH` / `WORKSPACE_DIR` /
+   `CHECKPOINT_SQLITE_PATH` 三条路径重定向到临时目录，**却漏了 `DATABASE_URL`**，它仍指向 `./data/…`。
+2. `app/main.py` 模块级调用的 `ensure_windows_selector_loop()` 写的是
+   `if sys.platform == "win32" and get_settings()...` —— **在 Windows 上会短路求值并调用
+   `get_settings()`，顺带创建出 `./data/`；在 Linux 上第一个条件即为假，`get_settings()` 根本不被调用**。
+   于是 Windows 上 `./data/` 因这个副作用而存在，Linux 上不存在；而 CI 是干净检出、`data/` 又被
+   `.gitignore` 排除 → SQLite 无处落库。
+
+**复现**（把 `DATABASE_URL` 指向不存在的目录，复刻 CI 条件）：
+
+```
+FAILED tests/test_api.py::test_engine_wired_with_tool_journal
+ERROR  tests/test_api.py::test_full_task_lifecycle / test_tools_manifest_is_mcp_shape
+ERROR  tests/test_api.py::test_metrics_endpoint / test_validation_error
+→ sqlite3.OperationalError: unable to open database file
+→ app/main.py:34 lifespan → repo.create_tables()
+1 failed, 38 passed, 4 errors
+```
+
+与 CI 现象完全吻合。`smoke` job 之所以过，是因为它先跑 `seed_demo_db.py`，那个脚本会
+`Path(db_path).parent.mkdir(parents=True, exist_ok=True)` 创建出 `./data/`。
+
+## Y. 修复（两处，都是真缺陷）
+
+| 文件 | 改动 | 为什么这算真缺陷而非"让测试变绿" |
+|---|---|---|
+| `tests/conftest.py` | fixture 内追加 `DATABASE_URL` 重定向（用 `as_posix()`，URL 里不能出现 Windows 反斜杠） | 符合 fixture 既有设计意图：测试应完全自包含，不该隐式依赖"工作目录下恰好有 `data/`" |
+| `app/main.py` | lifespan 退出时 `await engine.dispose()`；原先 `_, session_factory = make_engine_and_session(...)` 把引擎丢弃 | **真实的连接池/文件句柄泄漏**：每次 lifespan 都漏一个连接池，一直占着 SQLite 文件句柄。Linux 上因为"删除已打开的文件不报错"而被长期掩盖，Windows 上表现为临时目录无法清理 |
+
+> 第二处是被第一处**顺手暴露**出来的：把库文件移进每测试独立的临时目录后，fixture 拆除时
+> `TemporaryDirectory.cleanup()` 报 `PermissionError: [WinError 32] 另一个程序正在使用此文件` ——
+> 顺着回溯才发现引擎从未被 dispose。
+
+## Z. 验证
+
+| 场景 | 结果 |
+|---|---|
+| 条件1 正常（`data/` 存在） | ✅ 43 passed |
+| 条件2 CI 同款：`DATABASE_URL` 指向不存在的目录 | ✅ 43 passed |
+| 条件3 敌意：条件2 + `SEARCH_PROVIDER=bing` | ✅ 43 passed |
+| 全量套件（含 Docker/PG 两组，本机应 skip 6 条） | ✅ 43 passed, 6 skipped |
+
+耗时从修复前的 88s / 10.5s 回落到 ~5s。
+
+**仍未验证**：这两处修复尚未在真实 runner 上跑过（需再推一次）。`integration` job 已在真机上
+通过一次，但它无法覆盖本次改动，仍需重跑确认全绿。
+
+
 
 
 
