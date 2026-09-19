@@ -44,6 +44,14 @@ def settings():
         os.environ["TOOL_DB_PATH"] = str(Path(td) / "demo.sqlite")
         os.environ["WORKSPACE_DIR"] = str(Path(td) / "workspace")
         os.environ["CHECKPOINT_SQLITE_PATH"] = str(Path(td) / "ckpt.sqlite")
+        # 业务库也必须重定向，否则测试隐式依赖「当前工作目录下已存在 data/」：
+        # CI 是干净检出，data/ 被 .gitignore 排除因而不存在；而 get_settings() 只创建
+        # WORKSPACE_DIR / TOOL_DB_PATH / CHECKPOINT 三者的父目录（都被本 fixture 改到临时
+        # 目录了），没人创建 ./data/ → sqlite 报 "unable to open database file"。
+        # 这正是首轮 CI 上 test_api.py 5 个用例集体失败的原因。
+        # 注意用 as_posix()：SQLAlchemy URL 里不能出现 Windows 反斜杠，
+        # 否则解析出的库路径是坏的（实测 WinError 3 / 路径找不到）。
+        os.environ["DATABASE_URL"] = f"sqlite+aiosqlite:///{(Path(td) / 'agent.db').as_posix()}"
         s = get_settings()
         yield s
     get_settings.cache_clear()
