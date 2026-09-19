@@ -1,0 +1,189 @@
+name: CI
+
+# ── 触发条件 ─────────────────────────────────────────────────────────
+#   push 到 main / master
+#   指向 main / master 的 PR
+#   手动触发（Actions 页面 Run workflow）
+# 同一分支的新推送取消上一次未完成运行，避免排队堆积。
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+    branches: [main, master]
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+# ── 全局环境：默认全离线、封闭 ───────────────────────────────────────
+# 不依赖 LLM API Key、不依赖外网、不依赖 Docker daemon、不依赖 PostgreSQL。
+# 沙箱走 LocalSandbox；搜索引擎钉 mock（默认 bing/ddgs 会真的联网，且依赖页面结构，
+# 不适合做门禁）。需要 Docker / PostgreSQL 的检查单独放在 integration job。
+env:
+  PYTHONIOENCODING: utf-8
+  SANDBOX_MODE: local
+  ALLOW_UNSAFE_LOCAL_EXEC: "true"
+  QUEUE_MODE: local
+  CHECKPOINT_DB: sqlite
+  SEARCH_PROVIDER: mock
+  DATABASE_URL: sqlite+aiosqlite:///./data/ci_agent.db
+  TOOL_DB_PATH: ./data/demo.sqlite
+  WORKSPACE_DIR: ./data/workspace
+  CHECKPOINT_SQLITE_PATH: ./data/ci_checkpoints.sqlite
+  LLM_BASE_URL: http://127.0.0.1:9/v1
+  LLM_API_KEY: ci-dummy-key
+  LLM_MODEL: ci-model
+  LLM_MODEL_CHEAP: ci-cheap-model
+
+jobs:
+  # ── 门禁 1：静态检查（~20s，快速失败） ────────────────────────────
+  # 这关存在的直接原因：app/runtime.py 曾漏 import get_settings，导致 Windows 上
+  # `import app.main` 直接 NameError —— 服务与 Celery worker 双双起不来，
+  # 而单元测试里没人 import app.main，直到 test_api 收集失败才暴露。
+  # F82（undefined name）能在 20 秒内拦住这类缺陷，不必等整套测试跑完。
+  static:
+    name: 静态检查 · 语法 / 未定义名 / 导入期崩溃
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: 安装依赖
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install "ruff==0.16.7"
+
+      # 关键规则集：E9(语法错误) F63 F7 F82(未定义名)
+      # 刻意不启用风格类规则，避免与存量代码风格打架、让 CI 长期挂红而失去意义。
+      - name: ruff 关键规则
+        run: ruff check --select E9,F63,F7,F82 app tests scripts
+
+      - name: 语法编译
+        run: python -m compileall -q app tests scripts
+
+      # 覆盖两个进程入口的模块级调用链（import 不触发 lifespan，不建连接）
+      - name: 导入期冒烟
+        run: |
+          python -c "import app.main; print('app.main OK')"
+          python -c "import app.worker.celery_app; print('celery_app OK')"
+
+  # ── 门禁 2：离线单元测试（确定性，任何机器结果一致） ──────────────
+  # 49 条用例中，43 条完全离线；排除的 6 条需要 Docker/PostgreSQL，见 integration job。
+  test:
+    name: 单元测试 · 43 例离线套件
+    runs-on: ubuntu-latest
+    needs: static
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: 安装依赖
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      # 不加 -p no:randomly 之类的花活；全量收集，出现收集错误即失败。
+      - name: pytest（离线套件）
+        run: |
+          python -m pytest tests/ -q --no-header \
+            --ignore=tests/test_docker_sandbox.py \
+            --ignore=tests/test_postgres_checkpoint.py
+
+  # ── 门禁 3：集成测试（需要 Docker daemon，ubuntu runner 自带） ─────
+  # 这两组用例在本地无 Docker 环境时会被 pytest.skip，所以长期没有被真正执行过。
+  # 放到 CI 上跑，是「沙箱隔离」与「PostgreSQL checkpoint」两个卖点的唯一实测来源：
+  #   test_docker_sandbox        断言无挂载可执行 / 出网被拦 / uid=65534 / 超时被杀
+  #   test_postgres_checkpoint   拉一次性 postgres:16-alpine，验证 asyncpg+psycopg 双通道与重连落盘
+  integration:
+    name: 集成测试 · Docker 沙箱 + PostgreSQL checkpoint
+    runs-on: ubuntu-latest
+    needs: static
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: 安装依赖
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: 预拉取镜像（便于在日志里区分「拉镜像失败」与「断言失败」）
+        run: |
+          docker pull python:3.11-slim
+          docker pull postgres:16-alpine
+
+      - name: 预构建沙箱镜像
+        run: docker build -t agent-sandbox:latest ./sandbox
+
+      - name: pytest（Docker / PostgreSQL 集成）
+        run: |
+          python -m pytest tests/test_docker_sandbox.py tests/test_postgres_checkpoint.py \
+            -q --no-header -rs
+
+  # ── 门禁 4：端到端冒烟（把 README 的能力声明变成 CI 事实） ─────────
+  smoke:
+    name: 端到端冒烟 · CLI / 崩溃恢复 / 指标门禁
+    runs-on: ubuntu-latest
+    needs: static
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: 安装依赖
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: 初始化演示业务库
+        run: python scripts/seed_demo_db.py
+
+      # ── 以下三步故意注入 SEARCH_PROVIDER=bing ──────────────────────
+      # 回归护栏：这三个脚本必须自己把工具层冻结成 mock（不能只靠调用者的环境）。
+      # 曾经的问题：只设 LLM_MODEL=fake 只保证模型不出网，web_search 仍会按 .env
+      # 走真实搜索 —— 于是 demo 声称"离线"却真的联网，吞吐指标被网络 RTT 主导
+      # （同一命令在 bing / mock 下相差 5.9 倍：7.47 → 43.72 tasks/s）。
+      # 注入敌对值后仍自报 mock，才算约束成立。
+      - name: CLI 离线演示（必须 done，且自报 mock 搜索）
+        env:
+          SEARCH_PROVIDER: bing
+        run: |
+          python scripts/demo_cli.py --offline 2>&1 | tee /tmp/demo_cli.log
+          grep -q "状态: done" /tmp/demo_cli.log
+          grep -q "mock 搜索，不出网" /tmp/demo_cli.log
+
+      # 跨进程 checkpoint 恢复：子进程 A 到断点退出 → 子进程 B 恢复至完成
+      - name: 崩溃恢复演示（必须 done）
+        env:
+          SEARCH_PROVIDER: bing
+        run: |
+          python scripts/demo_crash_recovery.py 2>&1 | tee /tmp/crash.log
+          grep -q "status=done" /tmp/crash.log
+
+      # 量化指标门禁：恢复率与自愈率不允许低于 100%，且协议必须锁定 mock
+      # （沿用姊妹项目 campus-assistant 的做法：把质量基线写进 CI，防止静默退化）
+      - name: 指标门禁（恢复率 / 自愈率 = 100%，协议锁定 mock）
+        env:
+          SEARCH_PROVIDER: bing
+        run: |
+          python scripts/metrics.py --n 5 --m 10 2>&1 | tee /tmp/metrics.log
+          grep -Eq "断点恢复成功率[[:space:]]+100%" /tmp/metrics.log
+          grep -Eq "自愈挽救率[[:space:]]+100%" /tmp/metrics.log
+          grep -Eq "搜索=mock" /tmp/metrics.log
