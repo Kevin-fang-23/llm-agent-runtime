@@ -1,0 +1,58 @@
+# 完整模式编排：PostgreSQL（业务库+checkpoint）+ Redis（队列）+ API + Celery worker
+# 前置：cp .env.example .env 并填入 LLM 配置；构建沙箱镜像（worker 拉起沙箱容器时使用）：
+#   docker build -t agent-sandbox:latest ./sandbox
+# 启动：docker compose up --build
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: agent
+      POSTGRES_PASSWORD: agent
+      POSTGRES_DB: agent
+    ports: ["5432:5432"]
+    volumes: ["pgdata:/var/lib/postgresql/data"]
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U agent"]
+      interval: 3s
+      retries: 10
+
+  redis:
+    image: redis:7-alpine
+    ports: ["6379:6379"]
+
+  api:
+    build: .
+    ports: ["8000:8000"]
+    environment:
+      DATABASE_URL: postgresql+asyncpg://agent:agent@postgres:5432/agent
+      CHECKPOINT_DB: postgres
+      QUEUE_MODE: celery
+      REDIS_URL: redis://redis:6379/0
+      LLM_BASE_URL: ${LLM_BASE_URL}
+      LLM_API_KEY: ${LLM_API_KEY}
+      LLM_MODEL: ${LLM_MODEL}
+    depends_on:
+      postgres: {condition: service_healthy}
+      redis: {condition: service_started}
+
+  worker:
+    build: .
+    command: celery -A app.worker.celery_app:celery worker --loglevel=info --concurrency=4
+    environment:
+      DATABASE_URL: postgresql+asyncpg://agent:agent@postgres:5432/agent
+      CHECKPOINT_DB: postgres
+      QUEUE_MODE: celery
+      REDIS_URL: redis://redis:6379/0
+      LLM_BASE_URL: ${LLM_BASE_URL}
+      LLM_API_KEY: ${LLM_API_KEY}
+      LLM_MODEL: ${LLM_MODEL}
+    volumes:
+      # worker 在自己容器里调用宿主机 Docker daemon 拉起沙箱容器
+      # （Linux 适用；Win/Mac 需在宿主机单独跑 worker，见 README）
+      - /var/run/docker.sock:/var/run/docker.sock
+    depends_on:
+      postgres: {condition: service_healthy}
+      redis: {condition: service_started}
+
+volumes:
+  pgdata:

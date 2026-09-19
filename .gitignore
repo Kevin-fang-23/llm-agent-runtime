@@ -1,0 +1,10 @@
+__pycache__/
+*.pyc
+.env
+data/
+.pytest_cache/
+*.sqlite
+*.sqlite-journal
+*.sqlite-wal
+*.sqlite-shm
+docs/metrics.generated.md
