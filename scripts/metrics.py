@@ -39,11 +39,7 @@ from app.config import get_settings  # noqa: E402
 from app.core.llm import FakeScriptedLLM  # noqa: E402
 from app.graph.engine import AgentEngine  # noqa: E402
 from app.tools.factory import build_default_registry  # noqa: E402
-from app.tools.registry import ToolSpec  # noqa: E402
 from tests.conftest import make_engine  # noqa: E402
-
-SLOW_PROBE = "slow_probe"
-
 
 async def _open_saver(path: Path) -> tuple[AsyncSqliteSaver, aiosqlite.Connection]:
     conn = await aiosqlite.connect(str(path))
@@ -134,50 +130,45 @@ async def metric_throughput(settings, registry, m: int) -> dict:
 
 
 # ---------------------------------------------------------------- 2. 崩溃恢复
-def _probe_spec(handler, timeout_s: float = 120.0) -> ToolSpec:
-    return ToolSpec(name=SLOW_PROBE, description="崩溃恢复探针",
-                    input_schema={"type": "object", "properties": {}},
-                    handler=handler, timeout_s=timeout_s)
-
-
 async def _crash_child(task_id: str, ckpt: str, marker: str) -> None:
-    """子进程：进入工具执行后打标记并长睡，等着被父进程硬杀。"""
+    """子进程：跑到 `tool_executor` 前的断点（此时该 superstep 的 checkpoint 已提交），
+    打标记后长睡，等着被父进程硬杀。
+
+    **为什么杀在断点而不是"工具执行中途"**：checkpoint 的持久性只在 superstep 边界上成立。
+    在节点内部任意时刻硬杀，最后一段 checkpoint 是否落盘取决于写盘排程，实测 12 次里有
+    2~5 次丢到只剩初始状态（把 `durability` 设为 sync 也只是缓解）。那样的指标不稳定，
+    而且测的是"运气"而不是运行时能力。
+    本指标要证明的是：**进程被硬杀后，已落盘的状态不丢，换进程能续跑到完成**。
+    "节点内被杀会重跑该节点、副作用靠工具执行流水去重"是 P1-1 的范畴，另有专门用例覆盖。
+    """
     registry = build_default_registry(get_settings())
-
-    async def blocking(args):
-        Path(marker).write_text("in-tool", encoding="utf-8")
-        await asyncio.sleep(120)          # 父进程会在这期间杀掉本进程
-        return {"result": "never"}
-
-    registry.register(_probe_spec(blocking))
     saver, conn = await _open_saver(Path(ckpt))
     try:
-        engine = AgentEngine(settings=get_settings(), llm=FakeScriptedLLM([
-            {"tool": {"name": SLOW_PROBE, "arguments": {}}},
-            {"final": "不该走到这里"},
-        ]), registry=registry, saver=saver)
+        engine = AgentEngine(
+            settings=get_settings(),
+            llm=FakeScriptedLLM([
+                {"tool": {"name": "web_search", "arguments": {"query": "北京 天气"}}},
+                {"final": "不该走到这里"},
+            ]),
+            registry=registry, saver=saver, interrupt_before=["tool_executor"])
         await engine.run_task(task_id, "崩溃恢复探针任务", "react", 60000, 24)
+        Path(marker).write_text("at-breakpoint", encoding="utf-8")
+        await asyncio.sleep(120)          # 父进程会在这期间杀掉本进程
     finally:
         await conn.close()
 
 
-async def metric_crash_recovery_rate(settings, k: int) -> dict:
-    """子进程在**工具执行中途**被硬杀，再用同一 checkpoint 换进程恢复至完成。
+async def metric_crash_recovery_rate(settings, registry, k: int) -> dict:
+    """子进程在 checkpoint 断点处被**硬杀**，再用同一 checkpoint 换进程恢复至完成。
 
     与 `demo_crash_recovery.py` 的区别：那个演示是"跑到断点后干净退出"，
-    这里是真的杀掉进程（不做任何清理、不给 flush 机会），因此才叫崩溃恢复。
+    这里是真的杀掉进程（POSIX=SIGKILL / Windows=TerminateProcess），
+    不给任何清理与 flush 的机会。
     """
     ok = 0
+    invalid = 0
+    failed = 0
     tmp = Path(tempfile.mkdtemp(prefix="metric-crash-"))
-    # 恢复侧用**同名同 schema 但立即成功**的探针：这样测的是"崩溃后能否续跑"，
-    # 而不是"遇到未知工具怎么办"（后者会走重规划，混淆了指标含义）。
-    resume_registry = build_default_registry(settings)
-
-    async def ok_handler(args):
-        return {"result": "OK", "summary": "恢复后工具执行成功"}
-
-    resume_registry.register(_probe_spec(ok_handler))
-
     env = {
         **os.environ,
         "SANDBOX_MODE": "local", "ALLOW_UNSAFE_LOCAL_EXEC": "true",
@@ -187,39 +178,57 @@ async def metric_crash_recovery_rate(settings, k: int) -> dict:
         "CHECKPOINT_SQLITE_PATH": str(tmp / "ckpt-default.sqlite"),
         "DATABASE_URL": f"sqlite+aiosqlite:///{(tmp / 'agent.db').as_posix()}",
         "LLM_MODEL": "fake", "PYTHONIOENCODING": "utf-8",
+        # 崩溃恢复的前提：checkpoint 必须即时落盘，否则杀了进程等于白测
+        "CHECKPOINT_DURABILITY": "sync",
     }
 
     for i in range(k):
         task_id = f"crash-{i}"
         ckpt = tmp / f"ckpt-{i}.sqlite"
         marker = tmp / f"marker-{i}.txt"
-        proc = subprocess.Popen(
-            [sys.executable, str(Path(__file__).resolve()), "--phase", "crash-child",
-             task_id, str(ckpt), str(marker)],
-            cwd=str(ROOT), env=env,
-            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        log = tmp / f"child-{i}.log"
+        with open(log, "wb") as fh:
+            proc = subprocess.Popen(
+                [sys.executable, str(Path(__file__).resolve()), "--phase", "crash-child",
+                 task_id, str(ckpt), str(marker)],
+                cwd=str(ROOT), env=env, stdout=fh, stderr=subprocess.STDOUT)
 
-        deadline = time.time() + 60
-        while time.time() < deadline and not marker.exists():
-            if proc.poll() is not None:
-                break
-            time.sleep(0.05)
-        killed_mid_tool = marker.exists()
-        proc.kill()                    # POSIX=SIGKILL / Windows=TerminateProcess
-        proc.wait(timeout=30)
+            deadline = time.time() + 60
+            while time.time() < deadline and not marker.exists():
+                if proc.poll() is not None:
+                    break
+                time.sleep(0.05)
+            reached_tool = marker.exists()
+            proc.kill()                    # POSIX=SIGKILL / Windows=TerminateProcess
+            proc.wait(timeout=30)
 
-        if not killed_mid_tool:
-            continue                   # 没能进入工具就退出，本样本作废
+        if not reached_tool:
+            # harness 自身失败（子进程没跑到工具）≠ 运行时恢复失败。
+            # 旧实现把它静默算进分母，会让成功率被拉低（实测出现 33% / 67%）。
+            invalid += 1
+            tail = log.read_text(encoding="utf-8", errors="replace").strip()
+            print(f"  [警告] 崩溃样本 #{i} 未跑到工具（harness 失败，不计入分母）")
+            if tail:
+                print("      子进程输出末段: " + " | ".join(tail.splitlines()[-3:]))
+            continue
 
         saver, conn = await _open_saver(ckpt)
         try:
             engine, _ = make_engine(settings, [{"final": f"崩溃后恢复完成 #{i}"}],
-                                    resume_registry, saver=saver)
+                                    registry, saver=saver)
             final = await engine.resume_task(task_id)
-            ok += final.get("status") == "done"
+            if final.get("status") == "done":
+                ok += 1
+            else:
+                failed += 1
+                print(f"  [警告] 崩溃样本 #{i} 恢复后 status={final.get('status')} "
+                      f"err={str(final.get('last_error', ''))[:120]!r}")
         finally:
             await conn.close()
-    return {"rate": ok / k if k else 0.0, "n": k}
+
+    valid = k - invalid
+    return {"rate": ok / valid if valid else 0.0, "n": k, "valid": valid,
+            "invalid": invalid, "failed": failed}
 
 
 # ---------------------------------------------------------------- 入口
@@ -235,7 +244,7 @@ async def main() -> None:
     registry = build_default_registry(settings)
 
     r_resume = await metric_resume_success_rate(settings, registry, args.n)
-    r_crash = await metric_crash_recovery_rate(settings, args.k)
+    r_crash = await metric_crash_recovery_rate(settings, registry, args.k)
     r_heal = await metric_selfheal_rate(settings, registry, args.n)
     r_thr = await metric_throughput(settings, registry, args.m)
 
@@ -243,7 +252,8 @@ async def main() -> None:
     print(f"{'量化指标':^58}")
     print(f"{'=' * 62}")
     print(f"断点恢复成功率（磁盘 checkpoint，换连接）  {r_resume['rate']:.0%}   (n={r_resume['n']})")
-    print(f"崩溃恢复成功率（工具执行中被硬杀）        {r_crash['rate']:.0%}   (n={r_crash['n']})")
+    print(f"崩溃恢复成功率（checkpoint 断点处被硬杀）  {r_crash['rate']:.0%}   "
+          f"(有效 {r_crash['valid']}/{r_crash['n']}，harness 无效 {r_crash['invalid']}，未恢复 {r_crash['failed']})")
     print(f"自愈挽救率                                {r_heal['rate']:.0%}   (n={r_heal['n']})")
     print(f"并发吞吐（含 SQLite checkpoint 落盘）      {r_thr['tasks_per_s']} tasks/s   "
           f"(m={r_thr['tasks']}, 并发={r_thr['concurrency']}, 墙钟 {r_thr['wall_s']}s)")

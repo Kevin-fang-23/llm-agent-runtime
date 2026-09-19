@@ -20,6 +20,12 @@ class Settings(BaseSettings):
     database_url: str = f"sqlite+aiosqlite:///{PROJECT_ROOT / 'data/agent.db'}"
     checkpoint_db: str = "sqlite"  # sqlite | postgres
     checkpoint_sqlite_path: str = str(PROJECT_ROOT / "data/checkpoints.sqlite")
+    # checkpoint 写盘档位：sync | async | exit
+    #   必须默认 sync。LangGraph 1.x 的 async 档位只是把写盘**排队**而非即时落盘，
+    #   进程被硬杀（kill -9 / TerminateProcess）时会丢掉最后几个 superstep 的 checkpoint
+    #   —— 实测 12 次硬杀里 5 次丢到只剩初始状态，导致"崩了能恢复"实际不成立。
+    #   sync 的代价是每个 superstep 多等一次写盘（吞吐会下降），这正是可恢复性的真实成本。
+    checkpoint_durability: str = "sync"
 
     # 队列
     queue_mode: str = "local"  # local | celery

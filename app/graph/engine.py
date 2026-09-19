@@ -113,10 +113,15 @@ class AgentEngine:
         return task_id in self._canceled
 
     def _config(self, task_id: str) -> dict:
-        return {
+        cfg: dict = {
             "configurable": {"thread_id": task_id},
             "recursion_limit": self.settings.default_max_steps * 4 + 24,
         }
+        if self.saver is not None:
+            # 见 app/config.py::checkpoint_durability 的说明：
+            # 默认的 async 档位会让硬杀进程丢失最后几个 superstep 的 checkpoint。
+            cfg["durability"] = self.settings.checkpoint_durability
+        return cfg
 
     # ---------- 执行 ----------
     async def run_task(self, task_id: str, goal: str, mode: str,
