@@ -29,7 +29,7 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s %(name)s %(levelname
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     settings = get_settings()
-    _, session_factory = make_engine_and_session(settings.database_url)
+    engine, session_factory = make_engine_and_session(settings.database_url)
     repo = Repository(session_factory)
     await repo.create_tables()
 
@@ -56,6 +56,10 @@ async def lifespan(app: FastAPI):
     yield
     await queue.stop()
     await holder.close()
+    # 必须显式释放连接池：原先引擎被丢弃，进程存活期间会一直占着 SQLite 文件句柄
+    # （Windows 上表现为临时目录无法删除 / 无法 unlink 库文件），且每次 lifespan
+    # 都漏一个连接池。Linux 上因为「删除已打开的文件不报错」而被长期掩盖。
+    await engine.dispose()
 
 
 app = FastAPI(
