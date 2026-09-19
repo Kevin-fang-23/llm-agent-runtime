@@ -15,10 +15,10 @@
 | 任务分解与规划（双模式可切换） | ReAct / Plan-and-Execute 两个入口路由进同一状态机，critic 判定"计划缺陷"自动回 planner 重规划 | `app/graph/nodes.py` `route_entry` / `critic_node` |
 | 工具注册与沙箱执行 | MCP 风格描述符注册表（name/description/inputSchema）+ JSON Schema 校验；代码执行走 Docker 沙箱（断网/限内存 CPU/只读 FS/非 root） | `app/tools/registry.py`、`app/executor/sandbox.py` |
 | 失败自动重试与反思 | **结构化错误码**（timeout / network / rate_limited / upstream_5xx / auth / permission / not_found / invalid_args）驱动分类，不再依赖中文字符串嗅探；参数校验失败走自愈循环（配额按**单次调用**计）；运行期**瞬时**错误对声明 `retry_transient` 的只读工具做**指数退避原样重试**，上游给了 `Retry-After` 就**优先听它**；其余由 critic 按码分流：retryable→回决策 / plan_defect→重规划 / fatal→终止 | `app/core/errors.py` / `app/core/retry.py` / `_retry_transient` / `_classify_failure` |
-| 执行轨迹可视化 | 每个节点广播事件流落库，Web 时间线实时渲染（规划/思考/工具/自愈/预算/压缩全部可见） | `web/index.html`、`GET /api/tasks/{id}/trace` |
+| 执行轨迹可视化 | 每个节点广播事件流落库；Web 时间线经 **SSE 推送**实时渲染（无轮询），工具参数/结果可折叠，计划进度 chip，token/步数进度条；轨迹可导出 JSON / Markdown | `web/index.html`、`GET /api/tasks/{id}/stream`、`/export` |
 | 任务中断恢复（checkpoint） | LangGraph checkpointer 落 SQLite/PostgreSQL，进程崩溃后 `ainvoke(None)` 从断点续跑。**工具执行流水以 `(task_id, call_id)` 为幂等键**：checkpoint 重跑节点时回放已提交结果而非再执行一次（覆盖"工具已返回、流水已提交，但 checkpoint 未提交"的崩溃窗口） | `app/graph/engine.py` `resume_task`、`app/storage/models.py` `ToolExecution` |
 | Function Calling | 模型侧 OpenAI function calling，`tool_calls` 回填 `tool_call_id` 关联 | `app/core/llm.py`、`nodes.py` `_assistant_message` |
-| MCP（**描述符格式兼容，非完整接入**） | 工具清单按 MCP `tools/list` 结构输出（`GET /api/tools`，字段 `name/description/inputSchema`）。⚠️ **目前没有 MCP 服务端进程（无 stdio/SSE 传输），也没有 MCP 客户端去接外部 MCP 工具** —— 只做到"描述符形状一致" | `ToolSpec.mcp_descriptor()` |
+| MCP 服务端 | `app/mcp_server.py` 以 **stdio** 传输实现 `tools/list` + `tools/call`，可被任意 MCP 客户端接入（Claude Desktop / `mcp` CLI 等）；工具的 `inputSchema` 直接复用 registry 的 JSON Schema，调用走 `registry.execute()`，沙箱与结构化错误码全部复用 | `python -m app.mcp_server` |
 | LangGraph 状态机持久化 | StateGraph 六节点 + 条件边，checkpointer 可插拔（SQLite/PG） | `app/graph/engine.py` `_build` |
 | Docker 沙箱隔离 | network_disabled + mem_limit + nano_cpus + pids_limit + read_only + tmpfs + uid 65534 | `DockerSandbox` |
 | 异步任务队列 | 默认进程内 asyncio 队列（零依赖）；生产切 Celery+Redis（`QUEUE_MODE=celery`） | `app/worker/local_queue.py`、`celery_app.py` |
@@ -147,7 +147,9 @@ python scripts/demo_cli.py --offline   # 全链路：ReAct → 并行工具 → 
 | POST | `/api/tasks` | 提交任务 `{goal, mode, max_steps, max_tokens}`，返回 task_id |
 | GET | `/api/tasks` / `/api/tasks/{id}` | 列表 / 详情（含断点位置 `checkpoint_next`） |
 | GET | `/api/tasks/{id}/trace` | 全量轨迹事件 |
-| GET | `/api/tasks/{id}/events?after=N` | 增量轮询（前端时间线用） |
+| GET | `/api/tasks/{id}/events?after=N` | 增量轮询（保留给不支持 SSE 的环境；前端已改走 `/stream`） |
+| GET | `/api/tasks/{id}/stream` | **SSE 推送**轨迹事件 + 任务快照，终态后推 `stream_end` 并关闭 |
+| GET | `/api/tasks/{id}/export?format=json\|md` | 导出轨迹（结构化 JSON / 可贴进报告的 Markdown） |
 | POST | `/api/tasks/{id}/resume` | 从 checkpoint 恢复 |
 | POST | `/api/tasks/{id}/cancel` | 协作式取消（节点边界优雅收尾） |
 | GET | `/api/tools` | MCP `tools/list` 风格工具清单 |
@@ -177,7 +179,7 @@ docker compose up --build                        # PG + Redis + API + Celery wor
 
 ```bash
 python -m pytest tests/ -q
-# 49 个用例：43 条完全离线、可确定复现；6 条需 Docker daemon / PostgreSQL（不可用时自动 skip，CI 上会真跑）
+# 122 个用例：116 条完全离线、可确定复现；6 条需 Docker daemon / PostgreSQL（不可用时自动 skip，CI 上会真跑）
 ```
 
 覆盖：ReAct 循环与并行工具、Plan-Execute 与重规划、自愈循环（成功 / 耗尽降级 / **配额按调用计** / **并发不互相挤占**）、步数与 token 预算（含模型降级）、上下文压缩、checkpoint 跨引擎恢复、**工具执行流水幂等（真实崩溃窗口 + 对照组）**、**瞬时错误退避重试（闸门 / 上限 / 取消 / 真实等待）**、工具 Schema / 路径越狱 / SQL 只读、子 Agent 委托与递归防护、API 全生命周期、Docker 沙箱隔离、PostgreSQL checkpoint。
@@ -204,7 +206,7 @@ app/
 web/index.html         轨迹可视化（零依赖单页）
 sandbox/Dockerfile     代码执行沙箱镜像（python:3.11-slim 最小化）
 scripts/               CLI 演示 / 崩溃恢复演示 / 指标脚本 / Mock LLM / 种子库
-tests/                 49 个测试（43 离线 + 6 需 Docker/PG）
+tests/                 122 个测试（116 离线 + 6 需 Docker/PG）
 docs/                  目标差距评估与 P0/P1 修复记录
 .github/workflows/     CI 四道门禁
 ```

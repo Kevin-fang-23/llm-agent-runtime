@@ -1056,6 +1056,98 @@ grep 由固定空格数改为 `.*100%`，避免标签格式变化成为脆点。
 **未验证**：本轮改动**尚未在真实 runner 上跑过**，需再推一次触发 CI #3。
 `integration` job 会重跑（Docker 沙箱 + PostgreSQL），预计仍应通过。
 
+---
+
+# 附八：CI #3 核验 + 指标门禁稳定性事故 + P1-6 / P1-7（2026-09-19 第八轮）
+
+## AE. CI #3 全绿
+
+run #3（HEAD `2c0f2f1`）四个 job 全部 success：静态检查 28s / 单元测试 26s（含注入 `bing`
+的对抗性步骤）/ 冒烟 28s / 集成 42s。其中「指标门禁（四项指标 + 协议锁定）」step **success**。
+
+## AF. 门禁稳定性事故：崩溃恢复指标**曾经是假的稳定**
+
+按用户要求对四项指标做稳定性抽样，结果发现问题：
+
+| 指标 | 6 次连跑序列 |
+|---|---|
+| 断点恢复成功率 | 100% × 6 ✅ |
+| **崩溃恢复成功率** | 100, 100, **33**, 100, **67**, 100 ❌ |
+| 自愈挽救率 | 100% × 6 ✅ |
+| 并发吞吐 | 21.1 ~ 23.7（无阈值，只观测波动） |
+
+CI #3 恰好抽到 100% 通过 —— **一个不稳定门禁被一次绿灯掩盖了**。
+
+**根因（两层，都已修）**：
+
+1. **统计口径 bug**：子进程若没跑到工具，我 `continue` 跳过时**只漏掉了分子、仍用 `k` 做分母**，
+   把"harness 失败"静默算成"恢复失败"；同时子进程 stdout/stderr 被丢进 `DEVNULL`，等于销毁证据。
+2. **更深的一层：checkpoint 的持久性只在 superstep 边界成立**。放大到 12 次硬杀后，
+   `next` 分布为 `tool_executor` 7 / `__start__` 5 —— 也就是**工具明明跑过了，checkpoint 却丢回初始状态**。
+   进一步定位到 LangGraph 1.x 的 **`durability` 档位**：默认 `async` 只是把写盘**排队**，
+   进程被硬杀时队列里的 checkpoint 会丢。设 `sync` 后仍只是缓解（2/12 仍丢），
+   说明"在节点内部任意时刻硬杀"这个测法本身不可控。
+
+**修复（一次性，不补丁叠加）**：
+
+| 改动 | 内容 |
+|---|---|
+| `app/config.py` | 新增 `checkpoint_durability`（**默认 `sync`**）。<br>⚠️ 这是**生产级缺陷**：项目主打"崩了能恢复"，而默认 `async` 档位下硬杀会丢 checkpoint，承诺实际不成立。sync 的代价是每个 superstep 多等一次写盘。 |
+| `app/graph/engine.py` | `_config()` 在 `saver is not None` 时带上 `durability` |
+| `scripts/metrics.py` | ① 硬杀点固定在 **checkpoint 断点**（`interrupt_before=["tool_executor"]`，checkpoint 已提交后再真杀进程）；② 区分「harness 无效样本」与「恢复失败」，无效样本不计入分母并**显式告警**；③ 子进程输出落盘而非丢弃 |
+
+**复验**：12 次硬杀 → `next=['tool_executor']` **12/12**、恢复到 done **12/12**；
+6 次门禁连跑 → 三项指标**全部 100% × 6**，吞吐 18.6 ~ 22.6 tasks/s。门禁不再抖动。
+
+> 一句实话：这一轮最值钱的不是"指标变好看了"，而是**发现默认档位下崩溃恢复的承诺不成立**。
+> 若不是用户要求做稳定性抽样，它会以"CI 是绿的"一直潜伏下去。
+
+## AG. P1-6：MCP 服务端落地
+
+新增 `app/mcp_server.py`（stdio 传输，基于官方 `mcp` SDK）：`tools/list` + `tools/call`。
+依赖新增 `mcp>=2.0`。
+
+设计要点：
+- **工具的 `inputSchema` 直接沿用 registry 的 JSON Schema**，不另写一份 —— 只有一份事实来源。
+  （踩到并修掉：SDK 是**从函数签名重新生成** schema 的，只给裸类型会把 `description` 与
+  `minimum/maximum` 全丢掉；改用 `Annotated[T, Field(...)]` 才带过去。测试用**语义字段归一化比较**
+  做护栏。）
+- `tools/call` 走 `registry.execute()`：沙箱隔离、JSON Schema 校验、结构化错误码全部复用。
+- 执行期失败**直接返回 `CallToolResult(is_error=True)`** 而不是抛异常 —— 抛异常会被 SDK 包成
+  `"Error executing tool X"`，把错误码吞掉。
+- 明确分层：SDK 会先按 inputSchema 做**协议层**类型校验，类型错走不到业务层。
+
+测试 `tests/test_mcp_server.py` **5 条**，含**真实子进程 + 真实 MCP 客户端 stdio 握手**
+（initialize → list_tools → 调用成功 → 越界调用返回 isError 且错误码可见）。
+
+## AH. P1-7：轨迹可视化升级
+
+| 改动 | 内容 |
+|---|---|
+| `app/api/routes_tasks.py` | 新增 `GET /tasks/{id}/stream`（**SSE**）：推事件 + 任务快照（只在有变化时推），终态推 `stream_end` 后关闭；新增 `GET /tasks/{id}/export?format=json\|md` |
+| `app/storage/models.py` | `Event` 增加 `(task_id, seq)` **复合索引**（增量推送走的是这个范围扫描）+ 索引随 `create_all` 补建（无 Alembic 时的迁移路径，已实测） |
+| `web/index.html` | 轮询（1.5s）→ **EventSource**；事件参数/结果 `<details>` 可折叠；计划/降级/自愈 chip；token 与步数**双维进度条**；导出按钮 |
+| `tests/conftest.py` | `client` 夹具提到 conftest（多模块共用），并补上 `journal=repo`，与生产接线一致 |
+
+为什么 SSE 内部仍是"查库"：事件可能由**另一个进程**（Celery worker）产生，内存队列跨进程不可见，
+业务库是跨进程唯一可见的事件源。
+
+测试 `tests/test_trace_stream.py` **9 条**：SSE 事件序列与终止、data 段可解析、终态状态回传、
+404、导出 JSON/Markdown 形状、未知 format 400、旧增量接口仍可用、复合索引存在。
+
+## AI. 本轮总账
+
+| 项 | 结果 |
+|---|---|
+| 测试套件 | **116 passed, 6 skipped**（107 → 116，新增 MCP 5 + 轨迹 9，剔除重复计数） |
+| 静态检查 | `ruff`(E9/F63/F7/F82) clean（**第三次**拦下我的 F821：移夹具时漏改的引用） |
+| 敌对条件 | 无 `data/` 目录 + `SEARCH_PROVIDER=bing` → 116 passed |
+| 指标门禁 | 6 次连跑三项 100% + 12/12 硬杀恢复 |
+
+**未验证**：P1-6/P1-7 尚未在真实 runner 跑过（需再推一次）。MCP 测试依赖新增的 `mcp` 包，
+CI 会按 `requirements.txt` 安装 —— 若该包在 runner 上下载失败，`test` job 会红。
+
+
 
 
 
