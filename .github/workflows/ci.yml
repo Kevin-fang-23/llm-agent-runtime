@@ -189,13 +189,17 @@ jobs:
           python scripts/demo_crash_recovery.py 2>&1 | tee /tmp/crash.log
           grep -q "status=done" /tmp/crash.log
 
-      # 量化指标门禁：恢复率与自愈率不允许低于 100%，且协议必须锁定 mock
-      # （沿用姊妹项目 campus-assistant 的做法：把质量基线写进 CI，防止静默退化）
-      - name: 指标门禁（恢复率 / 自愈率 = 100%，协议锁定 mock）
+      # 量化指标门禁：四项指标都必须成立，且协议锁定 mock / sqlite。
+      # 沿用姊妹项目 campus-assistant 的做法：把质量基线写进 CI，防止静默退化。
+      # 用 `.*100%` 而非固定空格数匹配：指标标签带有口径说明后缀，格式不应成为脆点。
+      - name: 指标门禁（四项指标 + 协议锁定）
         env:
           SEARCH_PROVIDER: bing
         run: |
-          python scripts/metrics.py --n 5 --m 10 2>&1 | tee /tmp/metrics.log
-          grep -Eq "断点恢复成功率[[:space:]]+100%" /tmp/metrics.log
-          grep -Eq "自愈挽救率[[:space:]]+100%" /tmp/metrics.log
+          python scripts/metrics.py --n 5 --m 10 --k 3 2>&1 | tee /tmp/metrics.log
+          grep -Eq "断点恢复成功率.*100%" /tmp/metrics.log
+          grep -Eq "崩溃恢复成功率.*100%" /tmp/metrics.log
+          grep -Eq "自愈挽救率.*100%" /tmp/metrics.log
+          grep -Eq "并发吞吐.*tasks/s" /tmp/metrics.log
           grep -Eq "搜索=mock" /tmp/metrics.log
+          grep -Eq "checkpointer=sqlite" /tmp/metrics.log
