@@ -1,4 +1,11 @@
-"""测试公共夹具：离线假模型 + 本地沙箱 + 临时 SQLite。"""
+"""测试公共夹具：离线假模型 + mock 搜索 + 本地沙箱 + 临时 SQLite。
+
+铁律：**测试必须封闭**——模型层与工具层都要冻结。
+只钉模型层是不够的：`SEARCH_PROVIDER` 会回落到 `.env`，若那里是 `bing`，
+`web_search` 就会真的出网，测试结果随之变成"取决于必应当下是否可解析"。
+（本套件此前就踩过这个坑：`.env` 设了 bing，某次必应返回无法解析的页面，
+8 个用例集体失败——而同一份代码在必应可用时是绿的。）
+"""
 from __future__ import annotations
 
 import os
@@ -6,7 +13,7 @@ import sys
 import tempfile
 from pathlib import Path
 
-# 必须在导入 app 之前固定测试环境（避免触发 Docker / 真实 LLM）
+# 必须在导入 app 之前固定测试环境（避免触发 Docker / 真实 LLM / 真实搜索）
 os.environ["SANDBOX_MODE"] = "local"
 os.environ["ALLOW_UNSAFE_LOCAL_EXEC"] = "true"
 os.environ["QUEUE_MODE"] = "local"
@@ -14,6 +21,11 @@ os.environ["LLM_MODEL_CHEAP"] = "cheap-model"
 os.environ["COMPRESS_THRESHOLD_TOKENS"] = "3000"
 os.environ["LLM_MODEL"] = "test-model"
 os.environ["LLM_BASE_URL"] = "http://localhost:9/v1"
+# 工具层必须一起冻结，否则测试不封闭（见文件头说明）
+os.environ["SEARCH_PROVIDER"] = "mock"
+# 退避重试：测试默认零延迟，真实等待由 tests/test_retry_backoff.py 单独覆盖
+os.environ["RETRY_BASE_DELAY_S"] = "0"
+os.environ["RETRY_MAX_DELAY_S"] = "0"
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
