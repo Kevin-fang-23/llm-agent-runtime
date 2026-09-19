@@ -20,6 +20,7 @@ from typing import Any, Callable
 from langgraph.checkpoint.memory import MemorySaver
 
 from app.config import Settings
+from app.core.errors import ToolErrorCode
 from app.graph.engine import AgentEngine, _current_task_id
 from app.tools.registry import ToolExecutionError
 
@@ -86,8 +87,11 @@ def make_subagent_handler(
             return out
         # 子任务彻底失败（fatal/canceled）：对父任务表现为"委托失败"，
         # 不透传内部错误细节（避免父 critic 被子任务内部的致命关键字误判）——
-        # 细节已通过 subagent_event 完整保留在父任务轨迹中
-        raise ToolExecutionError(f"子任务执行失败（{status}），子任务错误已隔离")
+        # 细节已通过 subagent_event 完整保留在父任务轨迹中。
+        # 显式标注 retryable=False：重试一次等于重跑整棵子执行树，代价远超收益。
+        raise ToolExecutionError(
+            f"子任务执行失败（{status}），子任务错误已隔离",
+            code=ToolErrorCode.UNKNOWN, retryable=False)
 
     return handler
 

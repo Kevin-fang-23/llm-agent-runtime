@@ -13,6 +13,9 @@ from typing import Any
 import httpx
 import re
 
+from app.core.errors import ToolErrorCode, UpstreamHTTPError, parse_retry_after
+from app.tools.registry import ToolExecutionError
+
 _BING_UA = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0 Safari/537.36"}
 
 _TAG_RE = re.compile(r"<[^>]+>")
@@ -43,13 +46,30 @@ def _parse_bing(html: str, top_k: int) -> list[dict[str, str]]:
 
 async def _bing_search(query: str, top_k: int) -> dict[str, Any]:
     async with httpx.AsyncClient(timeout=12.0, follow_redirects=True) as client:
-        r = await client.get("https://cn.bing.com/search", params={"q": query, "count": str(top_k)}, headers=_BING_UA)
+        try:
+            r = await client.get("https://cn.bing.com/search",
+                                 params={"q": query, "count": str(top_k)}, headers=_BING_UA)
+        except httpx.TimeoutException as e:
+            # 结构化成 TIMEOUT：httpx 的文案是 "timed out"，与文本标记 "timeout" 并不匹配，
+            # 靠嗅探会漏判成"不可重试"。这里显式标注，不再依赖文案。
+            raise ToolExecutionError(f"必应搜索请求超时: {e}",
+                                     code=ToolErrorCode.TIMEOUT) from e
+        except httpx.TransportError as e:
+            raise ToolExecutionError(f"必应搜索连接失败: {e}",
+                                     code=ToolErrorCode.NETWORK) from e
     if r.status_code != 200:
-        raise RuntimeError(f"必应搜索返回 HTTP {r.status_code}")
+        raise UpstreamHTTPError(
+            r.status_code,
+            f"必应搜索返回 HTTP {r.status_code}",
+            retry_after_s=parse_retry_after(r.headers.get("Retry-After")),
+        )
     hits = _parse_bing(r.text, top_k)
     if not hits:
-        # 结构变更/被风控时明确报错，交给 critic 分类，而不是静默给空结果
-        raise RuntimeError("必应搜索未解析到结果（页面结构可能已变更）")
+        # 结构变更/被风控时明确报错，交给 critic 分类，而不是静默给空结果。
+        # 显式标 retryable=False：这看着像上游故障，但把同一个页面重抓一遍不会变好。
+        raise ToolExecutionError(
+            "必应搜索未解析到结果（页面结构可能已变更）",
+            code=ToolErrorCode.UNKNOWN, retryable=False)
     return {"result": hits, "summary": f"搜索「{query}」命中 {len(hits)} 条：" +
             "；".join(f"{h['title']}：{h['snippet'][:80]}" for h in hits)}
 

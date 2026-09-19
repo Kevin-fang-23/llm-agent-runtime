@@ -1,25 +1,53 @@
 """瞬时错误的判别与退避策略。
 
-判别与退避集中在这一处，供两个消费方共用，避免关键词表在两边各写一份后漂移：
-  - `tool_executor_node`：命中瞬时错误时**原样重试**同一调用（指数退避 + 上限）
-  - `critic_node`：把瞬时错误标为 retryable，交给模型层决策
+判定顺序（**结构化优先，文本兜底**）：
+  1. 异常显式标注了 `retryable` → 直接采信
+  2. 异常带结构化 `code`（且非 UNKNOWN）→ 查 `RETRYABLE_BY_CODE`
+  3. 都没有 → 退回 `looks_transient` 的文本标记匹配
 
-⚠️ `looks_transient` 是**字符串嗅探**，脆弱且会随错误文案漂移。它只是一个显式收口的
-   过渡实现；结构化错误码（工具返回 error_code / retryable）是后续工作。
-   把标记表收在单一模块里，就是为了让那次替换只需改这一处。
-   也正因为不可靠，自动重试**只认明确标记**（保守），不做「默认可疑即重试」——
-   未命中的运行错仍按原路径交给 critic。
+第 3 步是**过渡实现**：给尚未标注错误码的抛错点保底，使加固不改变既有行为。
+新代码应当抛带 `code` 的 `ToolExecutionError`（见 `app/core/errors.py`），
+这样"该不该重试"就是可枚举、可表驱动测试的确定性问题，而不是猜文本。
+
+两个消费方共用本模块，避免判定口径分叉：
+  - `tool_executor_node`：命中瞬时错误时**原样重试**同一调用（指数退避 + 上限）
+  - `critic_node`：按错误码把失败分流到 retryable / plan_defect / fatal
 """
 from __future__ import annotations
 
-# 瞬时错误标记（原先内联在 critic_node 里，为供自动重试复用而集中到这里，内容未改）
+from app.core.errors import RETRYABLE_BY_CODE, ToolErrorCode
+
+# 文本兜底标记（仅在异常未标注错误码时使用；内容与加固前一致）
 TRANSIENT_MARKERS = ("timeout", "超时", "connection", "网络", "temporarily")
 
 
 def looks_transient(error_text: str) -> bool:
-    """错误文本是否像瞬时故障而值得原样重试。保守判定：只认明确标记。"""
+    """错误文本是否像瞬时故障。保守判定：只认明确标记。"""
     lowered = (error_text or "").lower()
     return any(marker in lowered for marker in TRANSIENT_MARKERS)
+
+
+def is_transient_error(error: object) -> bool:
+    """错误是否值得**原样重试**。结构化优先，文本兜底（见模块 docstring）。"""
+    explicit = getattr(error, "retryable", None)
+    if explicit is not None:
+        return bool(explicit)
+    code = getattr(error, "code", None)
+    if code is not None and code is not ToolErrorCode.UNKNOWN:
+        return RETRYABLE_BY_CODE.get(code, False)
+    return looks_transient(str(error))
+
+
+def retry_delay_hint(error: object) -> float | None:
+    """上游给出的 Retry-After（秒）。有值时**优先于**指数退避计算。"""
+    value = getattr(error, "retry_after_s", None)
+    if value is None:
+        return None
+    try:
+        seconds = float(value)
+    except (TypeError, ValueError):
+        return None
+    return seconds if seconds >= 0 else None
 
 
 def backoff_delay(attempt: int, base_delay_s: float, max_delay_s: float) -> float:

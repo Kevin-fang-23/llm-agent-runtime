@@ -11,8 +11,9 @@ from typing import Any
 
 from app.core.budget import check_budget
 from app.core.compressor import compress_messages, inject_key_outputs, needs_compression
+from app.core.errors import ToolErrorCode
 from app.core.llm import estimate_messages_tokens
-from app.core.retry import backoff_delay, looks_transient
+from app.core.retry import backoff_delay, is_transient_error, looks_transient, retry_delay_hint
 from app.graph import prompts
 from app.graph.state import (
     ERR_FATAL,
@@ -47,6 +48,20 @@ def parse_json_loose(text: str) -> dict[str, Any] | None:
 
 def _plan_text(plan: list[dict]) -> str:
     return "\n".join(f"{i + 1}. [{p['status']}] {p['description']}" for i, p in enumerate(plan))
+
+
+# critic 的错误码 → 判定分流表。用**字符串**而非枚举成员：
+# 观测值会随 checkpoint 持久化，反序列化后错误码退回普通字符串，
+# 此时枚举集合交集会失配；统一按字符串比较即与持久化形态一致。
+_PLAN_DEFECT_CODES = {ToolErrorCode.INVALID_ARGS.value, ToolErrorCode.NOT_FOUND.value}
+_FATAL_CODES = {ToolErrorCode.PERMISSION.value, ToolErrorCode.AUTH.value}
+
+
+def _code_value(code: ToolErrorCode | str | None) -> str | None:
+    """错误码统一以字符串形态落进观测值与事件流（枚举也行，字面量也行）。"""
+    if code is None:
+        return None
+    return getattr(code, "value", code)
 
 
 def init_state(task_id: str, goal: str, mode: str, max_tokens: int, max_steps: int) -> AgentState:
@@ -268,14 +283,18 @@ class GraphNodes:
         results = await asyncio.gather(*(run_one(c) for c in calls))
         for call, obs in zip(calls, results):
             observations.append(obs)
+            # 失败时把结构化错误码一并交给模型：模型因此能区分"重试可能有用"与"改策略"
+            if obs["ok"]:
+                payload: dict = obs.get("result")
+            else:
+                payload = {"error": obs["error"]}
+                if obs.get("error_code"):
+                    payload["error_code"] = obs["error_code"]
             messages.append({
                 "role": "tool",
                 "tool_call_id": call["id"],
                 "name": call["name"],
-                "content": json.dumps(
-                    obs.get("result") if obs["ok"] else {"error": obs["error"]},
-                    ensure_ascii=False, default=str,
-                )[:6000],
+                "content": json.dumps(payload, ensure_ascii=False, default=str)[:6000],
             })
             if obs["ok"]:
                 await self.engine.emit(state, "tool_result", {
@@ -287,6 +306,7 @@ class GraphNodes:
                 await self.engine.emit(state, "tool_error", {
                     "tool": obs["tool"], "arguments": obs["arguments"],
                     "error": obs["error"], "error_type": obs["error_type"],
+                    "error_code": obs.get("error_code"),
                 })
 
         return {"messages": messages, "pending_tool_calls": [], "last_observations": observations,
@@ -343,82 +363,89 @@ class GraphNodes:
                     break
             if not healed:
                 return ({"ok": False, "tool": name, "arguments": args,
-                         "error": last_err, "error_type": "validation"},
+                         "error": last_err, "error_type": "validation",
+                         "error_code": _code_value(ToolErrorCode.INVALID_ARGS)},
                         attempts, repair_tokens_used)
         except ToolExecutionError as e:
-            result, last_err = await self._retry_transient(state, call, name, args, str(e))
+            result, last_err, err_code = await self._retry_transient(state, call, name, args, e)
             if result is None:
                 return ({"ok": False, "tool": name, "arguments": args,
-                         "error": last_err, "error_type": "runtime"},
+                         "error": last_err, "error_type": "runtime",
+                         "error_code": _code_value(err_code)},
                         attempts, repair_tokens_used)
 
         return ({"ok": True, "tool": name, "arguments": args, "result": result},
                 attempts, repair_tokens_used)
 
     async def _retry_transient(self, state: AgentState, call: dict, name: str, args: dict,
-                               first_error: str) -> tuple[dict | None, str]:
+                               first_error: ToolExecutionError) -> tuple[dict | None, str, object]:
         """对瞬时运行错**原样重试**同一调用（指数退避，上限 retry_max_attempts）。
 
-        返回 (成功的结果, 最后一次错误文本)；始终失败时结果为 None。
+        返回 (成功的结果, 最后一次错误文本, 最后一次错误码)；始终失败时结果为 None。
 
         与自愈循环的分工：
           - 自愈修「参数错」（ToolValidationError，改参数后重试）
           - 本方法重试「运行错」（ToolExecutionError，参数一字不改）
-        升级阶梯：本方法用尽 → 观测值带 runtime 错误 → critic 判 retryable →
+        升级阶梯：本方法用尽 → 观测值带 runtime 错误与错误码 → critic 按码分流 →
         交回 react_step 由模型决定换工具还是换策略。所以这里只做有限次盲重试，
         不试图在这里"解决"问题。
 
         三重闸门（缺一不可）：
-          1. 错误文本命中 TRANSIENT_MARKERS —— 永久性错误重试只是浪费；
+          1. 错误被判定为瞬时（结构化 code 优先，文本兜底）—— 永久性错误重试只是浪费；
           2. 工具声明 retry_transient —— 超时不等于失败，有副作用的工具盲目重试会做两遍；
           3. 未取消 —— 协作式取消要能立刻生效，不能卡在退避的 sleep 里。
         """
         # 先判瞬时性：非瞬时（含"未知工具"）直接退出，也避免为它去查不存在的 spec
-        if not looks_transient(first_error):
-            return None, first_error
+        if not is_transient_error(first_error):
+            return None, str(first_error), getattr(first_error, "code", None)
         try:
             retry_ok = self.engine.registry.get(name).retry_transient
         except ToolExecutionError:
-            return None, first_error  # 工具不在注册表里（错误正来自 get）：不可重试
+            return None, str(first_error), getattr(first_error, "code", None)
         if not retry_ok:
-            return None, first_error
+            return None, str(first_error), getattr(first_error, "code", None)
 
-        last_err = first_error
+        last_exc: ToolExecutionError = first_error
         attempts_made = 0
         for attempt in range(1, self.settings.retry_max_attempts + 1):
-            if not looks_transient(last_err):
+            if not is_transient_error(last_exc):
                 break  # 非瞬时错误：重试无意义
             if self.engine.is_canceled(state["task_id"]):
-                last_err = f"{last_err}（任务已取消，不再重试）"
-                break
-            delay = backoff_delay(attempt, self.settings.retry_base_delay_s,
-                                  self.settings.retry_max_delay_s)
+                return (None, f"{last_exc}（任务已取消，不再重试）",
+                        getattr(last_exc, "code", None))
+            # 上游给了 Retry-After 就听它的，否则退回指数退避
+            hint = retry_delay_hint(last_exc)
+            delay = hint if hint is not None else backoff_delay(
+                attempt, self.settings.retry_base_delay_s, self.settings.retry_max_delay_s)
             attempts_made = attempt
             await self.engine.emit(state, "tool_retry_scheduled", {
                 "tool": name, "call_id": call["id"], "attempt": attempt,
-                "delay_s": round(delay, 3), "error": last_err[:300],
+                "delay_s": round(delay, 3),
+                "delay_source": "retry_after" if hint is not None else "backoff",
+                "error_code": _code_value(getattr(last_exc, "code", None)),
+                "error": str(last_exc)[:300],
             })
             await asyncio.sleep(delay)
             try:
                 result = await self.engine.registry.execute(name, args)
             except ToolExecutionError as e:
-                last_err = str(e)
+                last_exc = e
                 continue
             except ToolValidationError as e:  # 防御分支：参数未改却报校验错，不可重试
-                last_err = f"重试期间参数校验失败: {e}"
-                break
+                return (None, f"重试期间参数校验失败: {e}", ToolErrorCode.INVALID_ARGS)
             await self.engine.emit(state, "tool_retry_success", {
                 "tool": name, "call_id": call["id"], "attempt": attempt,
                 "delay_s": round(delay, 3),
             })
-            return result, last_err
+            return result, str(last_exc), getattr(last_exc, "code", None)
 
         if attempts_made >= self.settings.retry_max_attempts > 0:
             await self.engine.emit(state, "tool_retry_exhausted", {
                 "tool": name, "call_id": call["id"], "attempts": attempts_made,
-                "error": last_err[:300],
+                "error_code": _code_value(getattr(last_exc, "code", None)),
+                "error": str(last_exc)[:300],
             })
-        return None, last_err
+        return None, str(last_exc), getattr(last_exc, "code", None)
 
     async def _repair_args(self, state, tool_name, bad_args, error) -> tuple[dict | None, int]:
         spec = self.engine.registry.get(tool_name)
@@ -462,20 +489,15 @@ class GraphNodes:
             return {"error_kind": ERR_NONE, "last_error": "", "plan": plan,
                     "current_step": idx + 1}
 
-        kinds = {o["error_type"] for o in failed}
+        codes = {o.get("error_code") for o in failed if o.get("error_code")}
+        error_types = {o.get("error_type") for o in failed}
         errors = "; ".join(o["error"][:200] for o in failed)
-        if any("未知工具" in o["error"] for o in failed):
-            kind = ERR_PLAN_DEFECT
-        elif kinds & {"validation"}:
-            kind = ERR_PLAN_DEFECT  # 自愈次数耗尽仍无法给出合法参数 → 计划/能力缺陷
-        elif looks_transient(errors):
-            kind = ERR_RETRYABLE
-        elif any(k in errors for k in ("越界", "Permission", "禁止", "路径")):
-            kind = ERR_FATAL
-        else:
-            kind = ERR_RETRYABLE
+        kind = self._classify_failure(codes, error_types, errors)
 
-        await self.engine.emit(state, "critic", {"verdict": kind, "errors": errors[:300]})
+        await self.engine.emit(state, "critic", {
+            "verdict": kind, "errors": errors[:300],
+            "error_codes": sorted(str(c) for c in codes),
+        })
         updates: dict = {"error_kind": kind, "last_error": errors}
         if kind == ERR_FATAL:
             updates["status"] = STATUS_FAILED
@@ -486,6 +508,32 @@ class GraphNodes:
                 updates["status"] = STATUS_FAILED
                 updates["needs_final"] = True
         return updates
+
+    @staticmethod
+    def _classify_failure(codes: set, error_types: set, errors: str) -> str:
+        """把工具失败分流为 plan_defect / fatal / retryable。
+
+        优先按**结构化错误码**判定（可枚举、可表驱动测试）；仅当观测值完全没有错误码时
+        才退回文本启发式——那条路径服务于从旧 checkpoint 恢复出来的历史观测值，
+        新产生的观测值一律带码。
+        """
+        if codes & _PLAN_DEFECT_CODES:
+            return ERR_PLAN_DEFECT    # 参数怎么修都非法 / 工具不存在 → 计划或能力缺陷
+        if codes & _FATAL_CODES:
+            return ERR_FATAL          # 安全与鉴权类：重试与重规划都无意义，直接终止
+        if codes:
+            return ERR_RETRYABLE      # 超时 / 网络 / 限流 / 上游 5xx 等 → 交回模型层决策
+
+        # ---- 以下为文本兜底（内容与结构化改造前逐条一致）----
+        if "未知工具" in errors:
+            return ERR_PLAN_DEFECT
+        if error_types & {"validation"}:
+            return ERR_PLAN_DEFECT    # 自愈次数耗尽仍无法给出合法参数 → 计划/能力缺陷
+        if looks_transient(errors):
+            return ERR_RETRYABLE
+        if any(k in errors for k in ("越界", "Permission", "禁止", "路径")):
+            return ERR_FATAL
+        return ERR_RETRYABLE
 
     # ---------- 上下文压缩 ----------
     async def compressor_node(self, state: AgentState) -> dict:
