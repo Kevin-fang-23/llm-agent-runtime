@@ -22,10 +22,47 @@ _TAG_RE = re.compile(r"<[^>]+>")
 _ENTITY_RE = re.compile(r"&[a-z#0-9]+;", re.I)
 _WS_RE = re.compile(r"\s+")
 
+# 相关性判定用：英文词 + 中文连续块
+_TOKEN_RE = re.compile(r"[A-Za-z][A-Za-z0-9\-']*|[\u4e00-\u9fff]+")
+_STOP = {
+    "the", "a", "an", "of", "and", "or", "to", "in", "on", "for", "is", "are",
+    "was", "were", "what", "which", "who", "whom", "when", "where", "how", "官方",
+}
+# 判定"结果是否与查询相关"的最低关键词命中比例
+_RELEVANCE_MIN = 0.5
+
 
 def _clean_text(s: str) -> str:
     s = _ENTITY_RE.sub(" ", s)
     return _WS_RE.sub(" ", s).strip()
+
+
+def _query_tokens(query: str) -> list[str]:
+    """抽取查询关键词。
+
+    **刻意排除纯数字**：年代/编号对相关性没有判别力，反而会让"2024年_百度百科"这种
+    年份词条看起来"沾边"。实测必应遇到实体查询时会退化成年份词条保底结果，
+    把数字计入 token 会让这类噪声被误判为相关。
+    """
+    return [t.lower() for t in _TOKEN_RE.findall(query)
+            if t.lower() not in _STOP and len(t) > 1]
+
+
+def _relevance(hit: dict[str, str], tokens: list[str]) -> float:
+    text = f"{hit.get('title', '')} {hit.get('snippet', '')}".lower()
+    return sum(1 for t in tokens if t in text) / len(tokens)
+
+
+def is_relevant_result(hits: list[dict[str, str]], query: str) -> bool:
+    """结果里是否有**至少一条**与查询沾边。
+
+    保守设计：只要有一条命中一半以上关键词就放行，把判断交给模型；
+    只有"全军覆没"才判定为召回失败。避免误杀正常查询。
+    """
+    tokens = _query_tokens(query)
+    if not tokens:
+        return True                      # 无法分词（如纯数字查询），不做判断
+    return any(_relevance(h, tokens) >= _RELEVANCE_MIN for h in hits)
 
 
 def _parse_bing(html: str, top_k: int) -> list[dict[str, str]]:
@@ -69,6 +106,17 @@ async def _bing_search(query: str, top_k: int) -> dict[str, Any]:
         # 显式标 retryable=False：这看着像上游故障，但把同一个页面重抓一遍不会变好。
         raise ToolExecutionError(
             "必应搜索未解析到结果（页面结构可能已变更）",
+            code=ToolErrorCode.UNKNOWN, retryable=False)
+    if not is_relevant_result(hits, query):
+        # 关键防线：页面解析成功、但结果是无关噪声时，**不要喂给模型**。
+        # 必应对实体/英文查询会退化成"年份词条"一类保底结果（实测查询
+        # "2024-25 NBA finals winner official result" 返回"2024年_百度百科""2024年日历"）。
+        # 若把这些当证据交给模型，模型会基于垃圾信息编造推理（实测出现过
+        # "该赛季尚未结束"这类与事实相反的臆断）。宁可明确告知"召回失败"。
+        raise ToolExecutionError(
+            f"搜索「{query}」未返回相关结果（命中条目为："
+            + "、".join(h["title"][:40] for h in hits[:3])
+            + "）。请换用更具体的关键词，或改用其他工具获取该信息。",
             code=ToolErrorCode.UNKNOWN, retryable=False)
     return {"result": hits, "summary": f"搜索「{query}」命中 {len(hits)} 条：" +
             "；".join(f"{h['title']}：{h['snippet'][:80]}" for h in hits)}
