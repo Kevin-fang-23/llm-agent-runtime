@@ -12,6 +12,9 @@ import sqlite3
 from pathlib import Path
 from typing import Any
 
+from app.core.errors import ToolErrorCode
+from app.tools.registry import ToolExecutionError
+
 _FORBIDDEN = (
     "insert", "update", "delete", "drop", "alter", "create", "attach",
     "detach", "pragma", "vacuum", "reindex", "replace", "grant", "revoke",
@@ -52,6 +55,18 @@ def _run_sync(db_path: str, sql: str, max_rows: int) -> dict[str, Any]:
             for row in rows
         ]
         return {"columns": cols, "rows": data, "truncated": truncated, "row_count": len(data)}
+    except sqlite3.OperationalError as e:
+        msg = str(e).lower()
+        # schema / 语法类错误：SQL 本身有问题，用同一条语句重试永远不会成功，
+        # 必须归为 INVALID_ARGS（critic 据此判 plan_defect → 改 SQL 重规划），
+        # 而不是落进"未识别 → 可重试"的默认分支去盲重试。
+        # 其余 OperationalError（database is locked、磁盘满等）保持原样上抛——那些确实可能重试成功。
+        schema_like = ("no such table", "no such column", "no such function",
+                       "syntax error", "has no column named")
+        if any(k in msg for k in schema_like):
+            raise ToolExecutionError(
+                f"SQL 无法执行: {e}", code=ToolErrorCode.INVALID_ARGS) from e
+        raise
     finally:
         conn.close()
 

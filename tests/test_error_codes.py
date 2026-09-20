@@ -181,6 +181,35 @@ async def test_unknown_tool_is_coded_not_found(registry):
     assert is_transient_error(ei.value) is False
 
 
+async def test_db_query_schema_error_is_invalid_args(tmp_path):
+    """引用不存在的表 → INVALID_ARGS：改 SQL 才有意义，盲重试永远不会成功。
+
+    （实测发现：此前这条错误没有错误码，落进"未识别→可重试"的默认分支。）
+    """
+    import sqlite3 as _sqlite3
+
+    from app.tools.db_query import make_db_query_handler
+
+    db = tmp_path / "demo.sqlite"
+    conn = _sqlite3.connect(db)
+    conn.execute("create table t(a int)")
+    conn.execute("insert into t values (1)")
+    conn.commit()
+    conn.close()
+
+    handler = make_db_query_handler(str(db))
+    with pytest.raises(ToolExecutionError) as ei:
+        await handler({"sql": "select * from nba_champions"})
+    assert ei.value.code is ToolErrorCode.INVALID_ARGS
+    assert is_transient_error(ei.value) is False          # 不该被当作瞬时故障重试
+    # critic 应据此判为计划缺陷（改 SQL 重规划），而非原地重试
+    assert GraphNodes._classify_failure({ei.value.code.value}, set(), "") == ERR_PLAN_DEFECT
+
+    # 正常查询不受影响
+    out = await handler({"sql": "select * from t"})
+    assert out["row_count"] == 1 and out["columns"] == ["a"]
+
+
 # ---------- 4. 端到端 ----------
 
 async def test_critic_verdict_table_is_exhaustive():
