@@ -179,7 +179,7 @@ docker compose up --build                        # PG + Redis + API + Celery wor
 
 ```bash
 python -m pytest tests/ -q
-# 122 个用例：116 条完全离线、可确定复现；6 条需 Docker daemon / PostgreSQL（不可用时自动 skip，CI 上会真跑）
+# 179 个用例：173 条完全离线、可确定复现；6 条需 Docker daemon / PostgreSQL（不可用时自动 skip，CI 上会真跑）
 ```
 
 覆盖：ReAct 循环与并行工具、Plan-Execute 与重规划、自愈循环（成功 / 耗尽降级 / **配额按调用计** / **并发不互相挤占**）、步数与 token 预算（含模型降级）、上下文压缩、checkpoint 跨引擎恢复、**工具执行流水幂等（真实崩溃窗口 + 对照组）**、**瞬时错误退避重试（闸门 / 上限 / 取消 / 真实等待）**、工具 Schema / 路径越狱 / SQL 只读、子 Agent 委托与递归防护、API 全生命周期、Docker 沙箱隔离、PostgreSQL checkpoint。
@@ -206,7 +206,7 @@ app/
 web/index.html         轨迹可视化（零依赖单页）
 sandbox/Dockerfile     代码执行沙箱镜像（python:3.11-slim 最小化）
 scripts/               CLI 演示 / 崩溃恢复演示 / 指标脚本 / Mock LLM / 种子库
-tests/                 122 个测试（116 离线 + 6 需 Docker/PG）
+tests/                 179 个测试（173 离线 + 6 需 Docker/PG）
 docs/                  目标差距评估与 P0/P1 修复记录
 .github/workflows/     CI 四道门禁
 ```
