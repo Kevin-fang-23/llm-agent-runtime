@@ -1,10 +1,15 @@
 """web_search 工具。
 
 search_provider：
-  - mock    内置确定性语料（离线演示/测试稳定）
-  - bing    必应国内版网页抓取（真实搜索，零 key，国内可达）
+  - mock    内置确定性语料（离线演示/测试稳定，代码默认值）
+  - auto    依次尝试 sogou → bing，用相关性校验挑第一个可用的源（推荐）
+  - sogou   搜狗网页搜索（零 key，国内可达，对实体查询召回最好）
+  - bing    必应国内版网页抓取（零 key，国内可达，但对实体/英文查询会退化成「年份词条」）
   - ddgs    DuckDuckGo（需可达国际网络）
 输出统一为 {result: [...], summary: "..."}，summary 进入不可压缩关键数据。
+
+所有源共用一道**相关性出口校验**（_ensure_relevant）：解析不出结果、或结果与查询
+完全不相关时一律报错，绝不把噪声当证据交给模型。
 """
 from __future__ import annotations
 
@@ -65,6 +70,27 @@ def is_relevant_result(hits: list[dict[str, str]], query: str) -> bool:
     return any(_relevance(h, tokens) >= _RELEVANCE_MIN for h in hits)
 
 
+def _ensure_relevant(hits: list[dict[str, str]], query: str, source: str) -> list[dict[str, str]]:
+    """各搜索源共用的出口校验：解析不出或全是噪声都不许放行。"""
+    if not hits:
+        # 结构变更/被风控时明确报错，而不是静默给空结果。
+        # 显式 retryable=False：把同一个页面重抓一遍不会变好。
+        raise ToolExecutionError(
+            f"{source}未解析到结果（页面结构可能已变更）",
+            code=ToolErrorCode.UNKNOWN, retryable=False)
+    if not is_relevant_result(hits, query):
+        # 关键防线：页面解析成功、但结果是无关噪声时，**不要喂给模型**。
+        # 实测 cn.bing.com 对实体/英文查询会退化成"年份词条"保底结果
+        # （查「2024-25 NBA finals winner official result」返回「2024年_百度百科」「2024年日历」），
+        # 把这些当证据交给模型，模型会基于垃圾信息编造推理。
+        raise ToolExecutionError(
+            f"{source}未返回相关结果（命中条目为："
+            + "、".join(h["title"][:40] for h in hits[:3])
+            + "）。请换用更具体的关键词，或改用其他工具获取该信息。",
+            code=ToolErrorCode.UNKNOWN, retryable=False)
+    return hits
+
+
 def _parse_bing(html: str, top_k: int) -> list[dict[str, str]]:
     """解析必应结果块（li.b_algo → 标题/链接/摘要）。结构变更时返回空列表。"""
     hits: list[dict[str, str]] = []
@@ -100,25 +126,62 @@ async def _bing_search(query: str, top_k: int) -> dict[str, Any]:
             f"必应搜索返回 HTTP {r.status_code}",
             retry_after_s=parse_retry_after(r.headers.get("Retry-After")),
         )
-    hits = _parse_bing(r.text, top_k)
-    if not hits:
-        # 结构变更/被风控时明确报错，交给 critic 分类，而不是静默给空结果。
-        # 显式标 retryable=False：这看着像上游故障，但把同一个页面重抓一遍不会变好。
-        raise ToolExecutionError(
-            "必应搜索未解析到结果（页面结构可能已变更）",
-            code=ToolErrorCode.UNKNOWN, retryable=False)
-    if not is_relevant_result(hits, query):
-        # 关键防线：页面解析成功、但结果是无关噪声时，**不要喂给模型**。
-        # 必应对实体/英文查询会退化成"年份词条"一类保底结果（实测查询
-        # "2024-25 NBA finals winner official result" 返回"2024年_百度百科""2024年日历"）。
-        # 若把这些当证据交给模型，模型会基于垃圾信息编造推理（实测出现过
-        # "该赛季尚未结束"这类与事实相反的臆断）。宁可明确告知"召回失败"。
-        raise ToolExecutionError(
-            f"搜索「{query}」未返回相关结果（命中条目为："
-            + "、".join(h["title"][:40] for h in hits[:3])
-            + "）。请换用更具体的关键词，或改用其他工具获取该信息。",
-            code=ToolErrorCode.UNKNOWN, retryable=False)
-    return {"result": hits, "summary": f"搜索「{query}」命中 {len(hits)} 条：" +
+    hits = _ensure_relevant(_parse_bing(r.text, top_k), query, "必应搜索")
+    return {"result": hits, "summary": f"[必应] 搜索「{query}」命中 {len(hits)} 条：" +
+            "；".join(f"{h['title']}：{h['snippet'][:80]}" for h in hits)}
+
+
+def _parse_sogou(html: str, top_k: int) -> list[dict[str, str]]:
+    """解析搜狗结果块（div.vrwrap → h3.vr-title > a 标题）。
+
+    实测搜狗对实体查询的召回明显好于必应（查「2025年NBA总冠军」时必应返回
+    「2025年_百度百科」，搜狗返回的是真正讨论该话题的页面），因此作为首选源。
+    """
+    hits: list[dict[str, str]] = []
+    blocks = re.findall(r'<div class="vrwrap">(.*?)(?=<div class="vrwrap">|<div id="pagebar_container"|$)',
+                        html, re.S)
+    for block in blocks:
+        m = re.search(r'<h3[^>]*class="[^"]*vr-title[^"]*"[^>]*>\s*<a[^>]*href="([^"]*)"[^>]*>(.*?)</a>',
+                      block, re.S)
+        if not m:
+            continue
+        title = _clean_text(_TAG_RE.sub("", m.group(2)))
+        # 摘要：整块剥标签后的文本（去掉 <style>、URL、图片地址等噪声），再剔除标题本身
+        body = re.sub(r"<style.*?</style>", " ", block, flags=re.S)
+        body = _clean_text(_TAG_RE.sub(" ", body))
+        body = _clean_text(re.sub(r"https?://\S+", " ", body))
+        # 剔除标题时用「去空白」形式定位：标题在块内是带 <em> 高亮的，剥标签后会多出空格，
+        # 与 clean 后的 title 不逐字相等，直接 replace 会剔不干净。
+        body_ns, title_ns = body.replace(" ", ""), title.replace(" ", "")
+        if title_ns and title_ns in body_ns:
+            i = body_ns.index(title_ns)
+            body = body_ns[:i] + " " + body_ns[i + len(title_ns):]
+        url = m.group(1)
+        if url.startswith("/link?"):
+            url = "https://www.sogou.com" + url
+        hits.append({"title": title, "url": url, "snippet": _clean_text(body)[:300]})
+        if len(hits) >= top_k:
+            break
+    return hits
+
+
+async def _sogou_search(query: str, top_k: int) -> dict[str, Any]:
+    async with httpx.AsyncClient(timeout=12.0, follow_redirects=True) as client:
+        try:
+            r = await client.get("https://www.sogou.com/web",
+                                 params={"query": query}, headers=_BING_UA)
+        except httpx.TimeoutException as e:
+            raise ToolExecutionError(f"搜狗搜索请求超时: {e}",
+                                     code=ToolErrorCode.TIMEOUT) from e
+        except httpx.TransportError as e:
+            raise ToolExecutionError(f"搜狗搜索连接失败: {e}",
+                                     code=ToolErrorCode.NETWORK) from e
+    if r.status_code != 200:
+        raise UpstreamHTTPError(
+            r.status_code, f"搜狗搜索返回 HTTP {r.status_code}",
+            retry_after_s=parse_retry_after(r.headers.get("Retry-After")))
+    hits = _ensure_relevant(_parse_sogou(r.text, top_k), query, "搜狗搜索")
+    return {"result": hits, "summary": f"[搜狗] 搜索「{query}」命中 {len(hits)} 条：" +
             "；".join(f"{h['title']}：{h['snippet'][:80]}" for h in hits)}
 
 _MOCK_CORPUS: dict[str, list[dict[str, str]]] = {
@@ -166,17 +229,42 @@ async def _ddgs_search(query: str, top_k: int) -> dict[str, Any]:
             "；".join(h["snippet"][:120] for h in hits[:top_k])}
 
 
+# auto 模式的源顺序。搜狗在前：实测它对实体查询的召回质量明显优于必应
+# （必应会退化成"年份词条"保底结果）。任一源通过相关性校验即返回。
+_AUTO_ORDER = ("sogou", "bing")
+
+
+async def _search_with(provider: str, query: str, top_k: int) -> dict[str, Any]:
+    if provider == "sogou":
+        return await _sogou_search(query, top_k)
+    if provider == "bing":
+        return await _bing_search(query, top_k)
+    if provider == "ddgs":
+        return await _ddgs_search(query, top_k)
+    return await _mock_search(query, top_k)
+
+
 def make_search_handler(provider: str):
     async def handler(args: dict[str, Any]) -> dict[str, Any]:
         query = args["query"].strip()
         if not query:
             raise ValueError("query 不能为空")
         top_k = int(args.get("top_k", 3))
-        if provider == "bing":
-            return await _bing_search(query, top_k)
-        if provider == "ddgs":
-            return await _ddgs_search(query, top_k)
-        return await _mock_search(query, top_k)
+
+        if provider != "auto":
+            return await _search_with(provider, query, top_k)
+
+        # auto：依次尝试各源，用相关性校验当判据；全部失败才报错，
+        # 并把每个源的失败原因合并回报，便于模型据此换关键词。
+        failures: list[str] = []
+        for p in _AUTO_ORDER:
+            try:
+                return await _search_with(p, query, top_k)
+            except ToolExecutionError as e:
+                failures.append(f"{p}: {e}")
+        raise ToolExecutionError(
+            f"所有搜索源均未返回相关结果。{' | '.join(failures)}",
+            code=ToolErrorCode.UNKNOWN, retryable=False)
 
     return handler
 

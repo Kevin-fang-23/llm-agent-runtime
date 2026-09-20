@@ -9,6 +9,7 @@ from __future__ import annotations
 import httpx
 import pytest
 
+from app.core.errors import ToolErrorCode
 from app.graph.prompts import REACT_SYSTEM
 from app.tools.registry import ToolExecutionError
 from app.tools.web_search import (
@@ -115,3 +116,121 @@ def test_prompt_forbids_fabricated_explanations():
     assert "编造解释" in REACT_SYSTEM
     assert "尚未" in REACT_SYSTEM          # 举了"该赛季尚未结束"这类臆断作为反例
     assert "不确定就说不确定" in REACT_SYSTEM
+
+
+# ---------------- 搜狗源与 auto 多源兜底 ----------------
+# 真实结构片段（2026-09-20 抓取自 www.sogou.com）
+SOGOU_HTML = """
+<div class="vrwrap"> <style>.struct201102 .real-tag { color: #205aef; }</style>
+ <div class="struct201102">
+  <h3 class="vr-title " vrcid="title.ba18e87">
+   <a class=" " target="_blank" href="/link?url=hedJjaC291ObqPUCEo1z" >恭喜步行者拿下<em><!--red_beg-->2025年的nba总冠军<!--red_end--></em>!_哔哩哔哩_bilibili </a>
+  </h3>
+  <div class="img-flex" id="component_1"><a id="x"><img src="https://img02.sogoucdn.com/v2/thumb?url=https%3A%2F%2Fx.com"></a></div>
+ </div>
+</div>
+<div class="vrwrap"> <style>.s{}</style>
+ <div class="struct201102">
+  <h3 class="vr-title " vrcid="title.b2"><a href="/link?url=abc"><em>2025年NBA总冠军</em>花落<em>谁家</em>呢-今日头条 </a></h3>
+  <div class="text-layout">北京时间6月23日，2023-24赛季NBA总决赛结束。</div>
+ </div>
+</div>
+"""
+
+
+def test_parse_sogou_extracts_titles_and_strips_highlight_tags():
+    from app.tools.web_search import _parse_sogou
+
+    hits = _parse_sogou(SOGOU_HTML, 5)
+    assert len(hits) == 2
+    # <em> 高亮标签必须剥掉，否则标题里会出现 HTML 残留
+    assert hits[0]["title"] == "恭喜步行者拿下2025年的nba总冠军!_哔哩哔哩_bilibili"
+    assert "<em>" not in hits[0]["title"]
+    # 相对链接要补全成可点击的绝对地址
+    assert hits[0]["url"].startswith("https://www.sogou.com/link?")
+    assert "sogoucdn" not in hits[0]["snippet"]      # 图片 CDN 噪声要清掉
+    # 标题必须从摘要里剔除干净（<em> 高亮会让标题多出空格，需按去空白形式比对）
+    assert "恭喜步行者" not in hits[1]["snippet"]
+    assert hits[1]["snippet"] == "北京时间6月23日，2023-24赛季NBA总决赛结束。"
+
+
+def test_parse_sogou_returns_empty_on_structure_change():
+    from app.tools.web_search import _parse_sogou
+
+    assert _parse_sogou("<html>完全换了结构</html>", 3) == []
+
+
+async def test_sogou_search_rejects_irrelevant(monkeypatch):
+    """搜狗源同样要过相关性校验：解析出结果但全是噪声时不许放行。"""
+    from app.tools import web_search as ws
+
+    noise_sogou = (
+        '<div class="vrwrap"><div class="struct201102">'
+        '<h3 class="vr-title"><a href="/link?url=1">2024年_百度百科</a></h3>'
+        '<div class="text-layout">2024年，是公历闰年，共366天、53周。</div></div></div>'
+    )
+
+    async def fake_get(self, url, **kwargs):
+        return _FakeResp(noise_sogou)
+
+    monkeypatch.setattr(httpx.AsyncClient, "get", fake_get)
+    with pytest.raises(ToolExecutionError) as ei:
+        await ws._sogou_search("2024-25 NBA finals winner official result", 3)
+    assert "搜狗搜索未返回相关结果" in str(ei.value)
+    assert ei.value.retryable is False
+
+
+async def test_auto_falls_back_to_next_source(monkeypatch):
+    """auto 的第一道防线：首选源召回失败时，自动落到下一个源。"""
+    from app.tools import web_search as ws
+
+    calls: list[str] = []
+
+    async def failing_sogou(query, top_k):
+        calls.append("sogou")
+        raise ToolExecutionError("搜狗搜索未返回相关结果", code=ToolErrorCode.UNKNOWN,
+                                 retryable=False)
+
+    async def ok_bing(query, top_k):
+        calls.append("bing")
+        return {"result": WEATHER_HITS, "summary": "[必应] 命中"}
+
+    monkeypatch.setattr(ws, "_sogou_search", failing_sogou)
+    monkeypatch.setattr(ws, "_bing_search", ok_bing)
+
+    handler = ws.make_search_handler("auto")
+    out = await handler({"query": "北京天气", "top_k": 3})
+    assert calls == ["sogou", "bing"]          # 确实先试搜狗、失败后落到必应
+    assert out["summary"].startswith("[必应]")
+
+
+async def test_auto_reports_all_sources_when_everything_fails(monkeypatch):
+    from app.tools import web_search as ws
+
+    async def bad(query, top_k):
+        raise ToolExecutionError("未返回相关结果（命中条目为：噪声）",
+                                 code=ToolErrorCode.UNKNOWN, retryable=False)
+
+    monkeypatch.setattr(ws, "_sogou_search", bad)
+    monkeypatch.setattr(ws, "_bing_search", bad)
+
+    handler = ws.make_search_handler("auto")
+    with pytest.raises(ToolExecutionError) as ei:
+        await handler({"query": "2025年NBA总冠军", "top_k": 3})
+    msg = str(ei.value)
+    assert "所有搜索源均未返回相关结果" in msg
+    assert "sogou:" in msg and "bing:" in msg   # 每个源的原因都要回报，便于模型换词
+    assert ei.value.retryable is False
+
+
+async def test_single_provider_does_not_try_others(monkeypatch):
+    """显式指定单个源时不应擅自兜底（避免"我明明配了 mock 却出网"这类意外）。"""
+    from app.tools import web_search as ws
+
+    async def should_not_run(query, top_k):
+        raise AssertionError("显式指定 provider 时不该尝试其他源")
+
+    monkeypatch.setattr(ws, "_sogou_search", should_not_run)
+    handler = ws.make_search_handler("mock")
+    out = await handler({"query": "北京天气", "top_k": 2})
+    assert out["result"]

@@ -61,7 +61,9 @@ class Settings(BaseSettings):
     # 工具
     tool_db_path: str = str(PROJECT_ROOT / "data/demo.sqlite")
     workspace_dir: str = str(PROJECT_ROOT / "data/workspace")
-    search_provider: str = "mock"  # mock | ddgs
+    # 默认 mock 是刻意选择：不配 .env 的调用方（含全部测试与离线脚本）必须不出网。
+    # auto 会按 sogou → bing 依次尝试，用相关性校验挑第一个可用的源。
+    search_provider: str = "mock"  # mock | auto | sogou | bing | ddgs
     tool_timeout_s: float = 30.0
     max_concurrent_tools: int = 4
 
