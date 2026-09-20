@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+from datetime import datetime
 from typing import Any
 
 from app.core.budget import check_budget
@@ -48,6 +49,22 @@ def parse_json_loose(text: str) -> dict[str, Any] | None:
 
 def _plan_text(plan: list[dict]) -> str:
     return "\n".join(f"{i + 1}. [{p['status']}] {p['description']}" for i, p in enumerate(plan))
+
+
+def _now_context() -> str:
+    """当前时间（本地时区）。
+
+    **每轮现构造，不写入 state.messages**：时间会流逝，写进历史下一刻就是错的；
+    而且历史里的旧时间会让模型产生矛盾（"到底哪个才是现在"）。
+    必须注入的原因是：模型无法感知真实时间，只能拿训练数据里的日期猜
+    —— 实测问"今天是几号"答成 2024-06-19，比真实日期早两年多。
+    """
+    now = datetime.now().astimezone()
+    weekday = "一二三四五六日"[now.weekday()]
+    raw = now.strftime("%z")                       # 形如 +0800
+    offset = f"{raw[:3]}:{raw[3:]}" if len(raw) == 5 else raw
+    return prompts.NOW_CONTEXT.format(
+        now=now.strftime("%Y-%m-%d %H:%M:%S"), weekday=f"星期{weekday}", offset=offset)
 
 
 # critic 的错误码 → 判定分流表。用**字符串**而非枚举成员：
@@ -115,7 +132,8 @@ class GraphNodes:
             user += f"\n现有背景信息：{plan_desc}" if plan_desc else ""
 
         messages = [
-            {"role": "system", "content": prompts.PLAN_SYSTEM.format(max_steps=state["max_steps"])},
+            {"role": "system", "content": prompts.PLAN_SYSTEM.format(max_steps=state["max_steps"])
+                                          + _now_context()},
             {"role": "user", "content": user},
         ]
         resp = await self.engine.llm.chat(messages, model=self._model(state))
@@ -180,7 +198,8 @@ class GraphNodes:
         #    上下文随步数近似 O(n²) 膨胀。实测 4 轮工具调用时第 5 次 LLM 调用收到
         #    5 份 system + 5 份 user，token 从 202 涨到 5184（26 倍），
         #    并连带打穿 compressor（其切片假设 system 只出现在头部）。
-        system = inject_key_outputs(prompts.REACT_SYSTEM, state.get("key_outputs", {}))
+        system = (inject_key_outputs(prompts.REACT_SYSTEM, state.get("key_outputs", {}))
+                  + _now_context())
         plan_context = ""
         if state.get("plan") and state["mode"] == "plan_execute":
             idx = state.get("current_step", 0)
@@ -583,7 +602,7 @@ class GraphNodes:
                 f"- [{p['status']}] {p['description']}：{p.get('result', '')[:200]}" for p in plan
             )
             messages = [
-                {"role": "system", "content": prompts.FINISH_SYSTEM},
+                {"role": "system", "content": prompts.FINISH_SYSTEM + _now_context()},
                 {"role": "user", "content": json.dumps({
                     "goal": state["goal"],
                     "key_outputs": key_outputs,
