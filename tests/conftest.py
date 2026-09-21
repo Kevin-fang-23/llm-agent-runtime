@@ -218,17 +218,33 @@ PG_IMAGE = "postgres:16-alpine"
 REDIS_IMAGE = "redis:7-alpine"
 
 
+def _free_host_port() -> int:
+    """取一个当前空闲的本地 TCP 端口。
+
+    为什么不传 None 让 Docker 随机分配：docker-py 对 ("127.0.0.1", None) 元组
+    会**静默忽略**端口映射（CI 实测 attrs["Ports"] 里根本没有该键 → KeyError），
+    而裸 None 会绑 0.0.0.0（把无鉴权容器的测试端口暴露到局域网）。
+    自选空闲端口 + 显式 ("127.0.0.1", port) 是 docker-py 文档明确支持且本地可验的
+    写法；「bind :0 释放 → 容器绑定」之间的小竞态窗口在单机 CI 上可忽略，
+    真撞上会在 ready_cmd 暴露而 skip，不会假绿。
+    """
+    import socket
+
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        s.bind(("127.0.0.1", 0))
+        return int(s.getsockname()[1])
+
+
 def _one_shot_container(image: str, name: str, port: int, env: dict | None = None,
                         ready_cmd: list[str] | None = None):
     """拉起一次性容器并等待就绪；Docker/镜像不可用时 pytest.skip。返回 (container, 宿主端口)。
 
     供 pg_url / redis_url 夹具共用：调用方负责 finally 里 remove(force=True)。
 
-    宿主端口**由 Docker 动态分配**（传 None）而不是固定端口：CI 的 integration job
-    里多个 module 顺序使用同类容器（如 postgres_checkpoint 与 celery_path 各起一个
-    PG），固定端口在「remove 旧容器 → 立即 run 新容器」的同端口复用下出现过
-    新容器首个应用连接被 RST 的确定性竞态（两个 CI job 同一失败模式，本地因无
-    Docker 从未暴露）。动态端口从容器 attrs 读实际映射，彻底消除复用。
+    宿主端口**动态选择**而不是固定端口：CI 的 integration job 里多个 module 顺序
+    使用同类容器（如 postgres_checkpoint 与 celery_path 各起一个 PG），固定端口在
+    「remove 旧容器 → 立即 run 新容器」的同端口复用下出现过新容器首个应用连接
+    被 RST 的确定性竞态（两个 CI job 同一失败模式，本地因无 Docker 从未暴露）。
     """
     import docker as docker_sdk
     import pytest
@@ -248,9 +264,10 @@ def _one_shot_container(image: str, name: str, port: int, env: dict | None = Non
         client.containers.get(name).remove(force=True)
     except Exception:
         pass
+    host_port = _free_host_port()
     container = client.containers.run(image, name=name, detach=True,
                                       environment=env or {},
-                                      ports={f"{port}/tcp": ("127.0.0.1", None)},
+                                      ports={f"{port}/tcp": ("127.0.0.1", host_port)},
                                       auto_remove=False)
     if ready_cmd:
         for _ in range(30):
@@ -261,8 +278,6 @@ def _one_shot_container(image: str, name: str, port: int, env: dict | None = Non
         else:
             container.remove(force=True)
             pytest.skip("容器未在超时内就绪")
-    host_port = int(container.attrs["NetworkSettings"]["Ports"]
-                    [f"{port}/tcp"][0]["HostPort"])
     return container, host_port
 
 
