@@ -212,21 +212,24 @@ def collect_events():
 
 
 # ---------------- 集成测试基础设施（无 Docker 自动 skip，CI runner 必跑） ----------------
+# 宿主端口由 Docker 动态分配（见 _one_shot_container 的说明），不再用固定端口。
 
-PG_PORT = 55432
 PG_IMAGE = "postgres:16-alpine"
-REDIS_PORT = 56379
 REDIS_IMAGE = "redis:7-alpine"
 
 
-def _one_shot_container(image: str, name: str, ports: dict, env: dict | None = None,
+def _one_shot_container(image: str, name: str, port: int, env: dict | None = None,
                         ready_cmd: list[str] | None = None):
-    """拉起一次性容器并等待就绪；Docker/镜像不可用时 pytest.skip。返回 (container, skip理由清理器)。
+    """拉起一次性容器并等待就绪；Docker/镜像不可用时 pytest.skip。返回 (container, 宿主端口)。
 
     供 pg_url / redis_url 夹具共用：调用方负责 finally 里 remove(force=True)。
-    """
-    import time
 
+    宿主端口**由 Docker 动态分配**（传 None）而不是固定端口：CI 的 integration job
+    里多个 module 顺序使用同类容器（如 postgres_checkpoint 与 celery_path 各起一个
+    PG），固定端口在「remove 旧容器 → 立即 run 新容器」的同端口复用下出现过
+    新容器首个应用连接被 RST 的确定性竞态（两个 CI job 同一失败模式，本地因无
+    Docker 从未暴露）。动态端口从容器 attrs 读实际映射，彻底消除复用。
+    """
     import docker as docker_sdk
     import pytest
 
@@ -246,39 +249,43 @@ def _one_shot_container(image: str, name: str, ports: dict, env: dict | None = N
     except Exception:
         pass
     container = client.containers.run(image, name=name, detach=True,
-                                      environment=env or {}, ports=ports, auto_remove=False)
+                                      environment=env or {},
+                                      ports={f"{port}/tcp": ("127.0.0.1", None)},
+                                      auto_remove=False)
     if ready_cmd:
         for _ in range(30):
             code, _ = container.exec_run(ready_cmd)
             if code == 0:
                 break
-            time.sleep(0.5)
+            _time.sleep(0.5)
         else:
             container.remove(force=True)
             pytest.skip("容器未在超时内就绪")
-    return container
+    host_port = int(container.attrs["NetworkSettings"]["Ports"]
+                    [f"{port}/tcp"][0]["HostPort"])
+    return container, host_port
 
 
 @pytest.fixture(scope="module")
 def pg_url():
-    """一次性 postgres:16-alpine，返回 asyncpg URL。"""
-    container = _one_shot_container(
-        PG_IMAGE, "agent-pg-test", {"5432/tcp": ("127.0.0.1", PG_PORT)},
+    """一次性 postgres:16-alpine，返回 asyncpg URL（宿主端口动态分配）。"""
+    container, host_port = _one_shot_container(
+        PG_IMAGE, "agent-pg-test", 5432,
         env={"POSTGRES_USER": "agent", "POSTGRES_PASSWORD": "agent", "POSTGRES_DB": "agent"},
         ready_cmd=["pg_isready", "-U", "agent"])
     try:
-        yield f"postgresql+asyncpg://agent:agent@127.0.0.1:{PG_PORT}/agent"
+        yield f"postgresql+asyncpg://agent:agent@127.0.0.1:{host_port}/agent"
     finally:
         container.remove(force=True)
 
 
 @pytest.fixture(scope="module")
 def redis_url():
-    """一次性 redis:7-alpine，返回 broker/backend URL。"""
-    container = _one_shot_container(
-        REDIS_IMAGE, "agent-redis-test", {"6379/tcp": ("127.0.0.1", REDIS_PORT)},
+    """一次性 redis:7-alpine，返回 broker/backend URL（宿主端口动态分配）。"""
+    container, host_port = _one_shot_container(
+        REDIS_IMAGE, "agent-redis-test", 6379,
         ready_cmd=["redis-cli", "ping"])
     try:
-        yield f"redis://127.0.0.1:{REDIS_PORT}/0"
+        yield f"redis://127.0.0.1:{host_port}/0"
     finally:
         container.remove(force=True)

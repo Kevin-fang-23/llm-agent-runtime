@@ -78,6 +78,21 @@ async def _setup_task(settings, task_id: str, goal: str = "查北京天气并总
         await engine.dispose()
 
 
+async def _setup_task_with_retry(settings, task_id: str, attempts: int = 5) -> None:
+    """PG 容器刚就绪时，首个应用连接曾实测在 asyncpg SSL 协商阶段被对端 RST
+    （CI 两个 job 同一失败模式；conftest 已把固定端口改为动态分配根治同端口
+    复用竞态，重试只是最后一道防线）。"""
+    last: Exception | None = None
+    for attempt in range(attempts):
+        try:
+            await _setup_task(settings, task_id)
+            return
+        except (ConnectionResetError, OSError) as e:  # noqa: PERF203
+            last = e
+            await asyncio.sleep(1.0 + attempt)
+    raise last  # type: ignore[misc]
+
+
 async def _fetch_task(settings, task_id: str):
     from app.storage.models import make_engine_and_session
     from app.storage.repository import Repository
@@ -228,7 +243,12 @@ def test_celery_real_broker_round_trip(client, settings, redis_url, monkeypatch,
     monkeypatch.setenv("QUEUE_MODE", "celery")
     get_settings.cache_clear()
 
-    # worker 子进程：环境变量注入与测试同一套临时路径（工具层冻结、假引擎在入口模块内替换）
+    # worker 子进程：环境变量注入与测试同一套临时路径（工具层冻结、假引擎在入口模块内替换）。
+    # CELERY_READY_MARKER：worker_ready 信号触发时入口模块写下的就绪标记文件 ——
+    # 代替 control ping 做就绪判定（ping 在 CI runner 上实测 60s 无 reply：
+    # worker 进程活着、Redis 已连、banner 正常，但 reply 一直不回来，
+    # 且 --loglevel=warning 吞掉就绪日志导致黑盒不可观测）。
+    marker = tmp_path / "worker_ready"
     env = {**os.environ,
            "DATABASE_URL": settings.database_url,
            "CHECKPOINT_SQLITE_PATH": settings.checkpoint_sqlite_path,
@@ -245,7 +265,8 @@ def test_celery_real_broker_round_trip(client, settings, redis_url, monkeypatch,
            "COMPRESS_THRESHOLD_TOKENS": "3000",
            "RETRY_BASE_DELAY_S": "0",
            "RETRY_MAX_DELAY_S": "0",
-           "ADMIN_API_KEY": "test-admin-key"}
+           "ADMIN_API_KEY": "test-admin-key",
+           "CELERY_READY_MARKER": str(marker)}
     entry = Path(__file__).parent / "_celery_worker_entry.py"
     log_path = tmp_path / "celery_worker.log"
     with open(log_path, "wb") as log:
@@ -255,16 +276,14 @@ def test_celery_real_broker_round_trip(client, settings, redis_url, monkeypatch,
             def _worker_log_tail() -> str:
                 return log_path.read_text(encoding="utf-8", errors="replace")[-2000:]
 
-            # worker 就绪：control ping 通过才投递，避免把「没起 worker」误判成「任务丢了」
+            # worker 就绪：轮询 worker_ready 信号写下的标记文件，拿到才投递，
+            # 避免把「没起 worker」误判成「任务丢了」
             ready = False
-            deadline = time.time() + 60
+            deadline = time.time() + 90
             while time.time() < deadline and proc.poll() is None:
-                try:
-                    if ca.celery.control.inspect(timeout=2).ping():
-                        ready = True
-                        break
-                except Exception:  # noqa: BLE001
-                    pass
+                if marker.exists():
+                    ready = True
+                    break
                 time.sleep(0.5)
             assert ready, f"worker 未在超时内就绪（exit={proc.poll()}）\n{_worker_log_tail()}"
 
@@ -303,7 +322,7 @@ def test_celery_eager_run_task_on_postgres(settings, registry, celery_eager, mon
     monkeypatch.setattr("app.runtime.build_engine_with_saver", _fake_builder(SCRIPT, registry))
 
     with _selector_policy_on_windows():
-        asyncio.run(_setup_task(pg_settings, "cel-pg"))
+        asyncio.run(_setup_task_with_retry(pg_settings, "cel-pg"))
         result = ca.run_task.delay("cel-pg", "查北京天气并总结", "react", 60000, 24)
         assert result.get()["status"] == "done"
         row = asyncio.run(_fetch_task(pg_settings, "cel-pg"))

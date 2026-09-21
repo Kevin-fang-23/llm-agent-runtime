@@ -40,6 +40,22 @@ _runtime.build_engine_with_saver = _build_engine_with_saver
 
 from app.worker.celery_app import celery  # noqa: E402
 
+# 就绪标记：worker_ready 信号在 consumer（含 control/pidbox）完全启动后触发，
+# 是 celery 官方语义的「就绪」。测试进程轮询该文件代替 control ping ——
+# ping 在 CI runner 上实测不可靠（worker 活着、Redis 已连、但 60s 无 reply，
+# 且 --loglevel=warning 吞掉就绪日志，黑盒不可观测）。
+import os  # noqa: E402
+
+_ready_marker = os.environ.get("CELERY_READY_MARKER")
+if _ready_marker:
+    from pathlib import Path as _Path  # noqa: E402
+
+    from celery.signals import worker_ready  # noqa: E402
+
+    @worker_ready.connect
+    def _write_ready_marker(**_):
+        _Path(_ready_marker).write_text("ready", encoding="utf-8")
+
 if __name__ == "__main__":
     # Windows 只支持 --pool=solo（README 已注明）；Linux 上 solo 同样可用，
     # 集成测试取两平台一致的最小形态。三个 without 关闭 gossip/mingle/heartbeat

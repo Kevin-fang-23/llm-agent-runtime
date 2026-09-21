@@ -118,9 +118,11 @@ jobs:
           PY
 
   # ── 门禁 2：离线单元测试（确定性，任何机器结果一致） ──────────────
-  # 389 条用例中，379 条完全离线；余下 10 条需要 Docker/PostgreSQL/Redis，见 integration job。
+  # 389 条用例中，375 条完全离线；余下 14 条需要 Docker/PostgreSQL/Redis，
+  # 见 integration job（celery_path 的 6 条用例归集成 job —— 其外部服务用例
+  # 在 CI runner 上真跑，放离线套件会让 test job 依赖容器，破坏确定性口径）。
   test:
-    name: 单元测试 · 381 例离线套件
+    name: 单元测试 · 375 例离线套件
     runs-on: ubuntu-latest
     needs: static
     steps:
@@ -141,24 +143,29 @@ jobs:
         run: |
           python -m pytest tests/ -q --no-header \
             --ignore=tests/test_docker_sandbox.py \
-            --ignore=tests/test_postgres_checkpoint.py
+            --ignore=tests/test_postgres_checkpoint.py \
+            --ignore=tests/test_celery_path.py
 
       # 测试数下限门禁：README 里的用例数曾被改漏（193 / 206 / 197 三处互相矛盾），
       # 数字对不齐会直接削弱"用数据说话"的可信度。收集数低于阈值即失败，
       # 逼着改动者在删用例时同步文档。
       # 计数方式：--collect-only -q 每行一个用例、行内含 `::`；末尾汇总行不含 `::`，
       # 所以 grep -c '::' 恰好等于用例数。
-      # 口径（实测 2026-09-21，排除 docker/postgres 两个文件后）：收集 381 = 379 passed
-      #   + 2 skipped（test_celery_path 里两条需 Docker 的用例，本机无 daemon 而 skip）。
+      # 口径（实测 2026-09-21 第四轮，排除 docker/postgres/celery 三个文件后）：
+      # 收集 375 = 375 passed（CI runner 上 celery_path 的外部服务用例会真跑，
+      # 必须排除在离线套件之外保持确定性口径）。
       # 阈值随套件增长单调上调，绝不下调 —— 下调等于给"删用例"开口子。
-      - name: 测试数门禁（离线收集数不得低于 379）
+      # 例外说明：379 → 375 是把 celery_path 6 条用例**移入** integration job
+      # （非删除），用例总数 389 不变。
+      - name: 测试数门禁（离线收集数不得低于 375）
         run: |
           n=$(python -m pytest tests/ --collect-only -q \
             --ignore=tests/test_docker_sandbox.py \
-            --ignore=tests/test_postgres_checkpoint.py 2>&1 \
+            --ignore=tests/test_postgres_checkpoint.py \
+            --ignore=tests/test_celery_path.py 2>&1 \
             | grep -c '::' || true)
-          echo "离线套件收集到 $n 个用例（阈值 379）"
-          test "$n" -ge 379 || { echo "用例数低于 379，请同步 README / CI 中的数字"; exit 1; }
+          echo "离线套件收集到 $n 个用例（阈值 375）"
+          test "$n" -ge 375 || { echo "用例数低于 375，请同步 README / CI 中的数字"; exit 1; }
 
       # 对抗性门禁：注入敌对 provider，证明套件真的封闭（不依赖 .env 的 SEARCH_PROVIDER）。
       # 曾发生过的事故：conftest 只冻结了模型层，SEARCH_PROVIDER 回落到 .env 的 bing，
@@ -170,7 +177,8 @@ jobs:
         run: |
           python -m pytest tests/ -q --no-header \
             --ignore=tests/test_docker_sandbox.py \
-            --ignore=tests/test_postgres_checkpoint.py
+            --ignore=tests/test_postgres_checkpoint.py \
+            --ignore=tests/test_celery_path.py
 
   # ── 门禁 3：集成测试（需要 Docker daemon，ubuntu runner 自带） ─────
   # 这三组用例在本地无 Docker 环境时会被 pytest.skip，所以长期没有被真正执行过。

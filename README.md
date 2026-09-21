@@ -109,8 +109,8 @@ python scripts/demo_cli.py --offline   # 全链路：ReAct → 并行工具 → 
 | Job | 内容 |
 |---|---|
 | `static` | `ruff --select E9,F63,F7,F82`（**F821 未定义名**，专拦"缺 import 导致导入期崩溃"）+ `compileall` + `import app.main` / `import app.worker.celery_app` 冒烟 |
-| `test` | 381 条离线用例（含注入 `SEARCH_PROVIDER=bing` 的对抗步骤），结果与机器无关 |
-| `integration` | Docker 沙箱 4 例（无挂载执行 / 出网被拦 / uid=65534 / 超时被杀）+ PostgreSQL checkpoint 2 例 + PG 租户列迁移 1 例 + **PG Alembic 自举 1 例**（历史库现场重建 → 补列 → stamp → 二次幂等）+ **Celery 路径 3 例（Redis 真实 broker 往返：API → Redis → 独立 worker 子进程 → DB；Celery+PG 存储形态）**（本地无 daemon 自动 skip，CI 上会真跑） |
+| `test` | 375 条离线用例（含注入 `SEARCH_PROVIDER=bing` 的对抗步骤），结果与机器无关；celery 路径整体归入 `integration` job（其外部服务用例在 CI 上真跑，放离线套件会破坏确定性口径） |
+| `integration` | Docker 沙箱 4 例（无挂载执行 / 出网被拦 / uid=65534 / 超时被杀）+ PostgreSQL checkpoint 2 例 + PG 租户列迁移 1 例 + PG Alembic 自举 1 例 + **Celery 路径 6 例（eager 任务体 3 / API 分发 1 / Redis 真实 broker 往返：API → Redis → 独立 worker 子进程 → DB 1 / Celery+PG 存储形态 1；worker 就绪判定用 `worker_ready` 信号标记文件，容器端口由 Docker 动态分配）**（本地无 daemon 自动 skip，CI 上会真跑） |
 | `smoke` | CLI 全链路 / 崩溃恢复 / **指标门禁**（恢复率与自愈率断言 100%）；三步均注入敌对 `SEARCH_PROVIDER=bing`，断言脚本仍自报 `mock` —— 防止"离线脚本偷偷联网"复发 |
 
 ## 四、架构
@@ -196,7 +196,9 @@ docker compose up --build                        # PG + Redis + API + Celery wor
 
 ```bash
 python -m pytest tests/ -q
-# 389 个用例：379 条完全离线、可确定复现；10 条需 Docker daemon / PostgreSQL / Redis（不可用时自动 skip，CI 上会真跑）
+# 389 个用例：379 条本地直接可跑（含 celery eager 离线路径）；10 条需 Docker daemon /
+# PostgreSQL / Redis（不可用时自动 skip，CI 上会真跑）。
+# CI 口径：test job 收集 375（celery_path 整体归入 integration job），integration 14 条。
 ```
 
 覆盖：ReAct 循环与并行工具、Plan-Execute 与重规划、**计划 DAG（deps 解析双形态 / Kahn 分层 / 非法计划三级兜底 / 分批并行端到端 / critic 整批推进 / ReAct↔Plan 自适应升降级 / replan id 顺延唯一）**、**Alembic 迁移（全新库 upgrade / 旧库补列 stamp / 幂等 / 列集合防漂移对照）**、自愈循环（成功 / 耗尽降级 / **配额按调用计** / **并发不互相挤占**）、步数与 token 预算（含模型降级）、上下文压缩、checkpoint 跨引擎恢复、**工具执行流水幂等（真实崩溃窗口 + 对照组）**、**瞬时错误退避重试（闸门 / 上限 / 取消 / 真实等待）**、工具 Schema / 路径越狱 / SQL 只读、子 Agent 委托与递归防护、API 全生命周期、**鉴权（401/403 语义、key 哈希、轮换、禁用）、租户隔离、四层限流与配额、零配置引导、旧库迁移**、**可观测性（traceparent 解析与贯穿 / **完整 span 树（父子关系、自耗时只扣直接子、孤儿与自环兜底、异常路径也闭合、上下文还原）** / Prometheus 文本格式 / **直方图分桶单调性与可配分桶（非法值逐项跳过 / 全非法才回退默认）** / 结构化日志 / **脱敏（8 条规则 + 递归 extra/args/异常栈 + 幂等不变量）** / **采样（首条必留 / 每 N 条留 1 / WARNING 永不丢 / Filter 顺序）** / **进程身份指标（低基数标签 / build_info 恒为 1 / PROCESS_INSTANCE 构成）** / `/metrics` 无高基数标签）**、**Celery 路径（eager 任务体 / API 分发 / Redis 真实 broker 往返：API → Redis → 独立 worker 子进程 → DB / Celery+PG 存储形态）**、Docker 沙箱隔离、PostgreSQL checkpoint（含租户列迁移与 Alembic 自举的 PG 分支）。
