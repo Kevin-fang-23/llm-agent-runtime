@@ -187,9 +187,9 @@ jobs:
   #   test_docker_sandbox        断言无挂载可执行 / 出网被拦 / uid=65534 / 超时被杀
   #   test_postgres_checkpoint   拉一次性 postgres:16-alpine，验证 asyncpg+psycopg 双通道、
   #                              重连落盘，以及租户列迁移的 PG 分支
-  #   test_celery_path           Celery 任务体（eager）+ API 分发（离线部分随 test job 跑）、
-  #                              Redis 真实 broker 往返（API → Redis → 独立 worker 子进程 → DB）、
-  #                              Celery + PG 业务库/checkpoint 形态
+  #   test_celery_path           Celery 任务体（eager）+ API 分发 + 真实 broker 往返（API → Redis →
+  #                              独立 worker 子进程 → DB）+ Celery+PG 业务库/checkpoint 形态，
+  #                              整个文件归本 job（外部服务用例在 CI runner 上真跑）
   integration:
     name: 集成测试 · Docker 沙箱 + PostgreSQL + Celery/Redis
     runs-on: ubuntu-latest

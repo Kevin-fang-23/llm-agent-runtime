@@ -238,10 +238,30 @@ def test_celery_real_broker_round_trip(client, settings, redis_url, monkeypatch,
     """API → Redis → 独立 worker 子进程 → DB 写回 done。compose 生产形态的端到端。"""
     from app.worker import celery_app as ca
 
-    ca.celery.conf.update(broker_url=redis_url, result_backend=redis_url)
-    monkeypatch.setattr(ca, "settings", get_settings())
+    ca.celery.conf.update(broker_url=redis_url, broker_read_url=redis_url,
+                          broker_write_url=redis_url, result_backend=redis_url)
+    monkeypatch.setattr(ca, "settings", get_settings().model_copy(
+        update={"redis_url": redis_url}))
+    monkeypatch.setenv("REDIS_URL", redis_url)
     monkeypatch.setenv("QUEUE_MODE", "celery")
     get_settings.cache_clear()
+
+    # 强制投递使用「此刻新建」的 producer 连接：同一进程内更早的用例/夹具可能让
+    # celery 的 producer 池缓存了指向 settings 默认地址（localhost:6379）的旧
+    # Connection（ChannelPromise 构造时固化 URL），conf.update 对已缓存对象无效
+    # —— CI 实测 producer publish 打到 localhost:6379 而 conf.broker_url 已是
+    # 动态端口。wrapper 绕开所有池缓存：connection_for_write() 每次读当前 conf。
+    import kombu
+
+    _orig_send_task = ca.celery.send_task
+
+    def _send_with_fresh_producer(name, *args, **kwargs):
+        kwargs.pop("producer", None)
+        with ca.celery.connection_for_write() as conn:
+            with kombu.Producer(conn) as prod:
+                return _orig_send_task(name, *args, producer=prod, **kwargs)
+
+    ca.celery.send_task = _send_with_fresh_producer
 
     # worker 子进程：环境变量注入与测试同一套临时路径（工具层冻结、假引擎在入口模块内替换）。
     # CELERY_READY_MARKER：worker_ready 信号触发时入口模块写下的就绪标记文件 ——
