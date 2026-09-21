@@ -12,7 +12,8 @@
 
 | 需求 | 实现 | 代码入口 |
 |---|---|---|
-| 任务分解与规划（双模式可切换） | ReAct / Plan-and-Execute 两个入口路由进同一状态机，critic 判定"计划缺陷"自动回 planner 重规划 | `app/graph/nodes.py` `route_entry` / `critic_node` |
+| 任务分解与规划（DAG + 双模式自适应） | ReAct / Plan-and-Execute 两入口路由进同一状态机；计划支持 `deps` 依赖声明（**Kahn 分层**，独立步骤同批并行；`deps` 键缺省=线性链，旧 prompt / 旧 checkpoint 零迁移）；critic 判定"计划缺陷"自动回 planner 重规划（id 顺延重编号防撞）；**连续缺陷达阈值自动降级 ReAct、ReAct 重规划成功自动升级回 Plan** | `app/graph/nodes.py` `_plan_layers` / `planner_node` / `critic_node` |
+| 数据库迁移框架（Alembic） | schema 演进交给 Alembic：baseline 由 autogenerate 从 metadata 生成（非手抄），列集合对照用例在 CI 防漂移；`create_tables` 三路径自举 —— 全新库 `upgrade head` / 旧库补列后 `stamp` / 已版本化幂等空操作；async env 手工实现官方模板，零新驱动 | `migrations/`、`app/storage/repository.py` |
 | 工具注册与沙箱执行 | MCP 风格描述符注册表（name/description/inputSchema）+ JSON Schema 校验；代码执行走 Docker 沙箱（断网/限内存 CPU/只读 FS/非 root） | `app/tools/registry.py`、`app/executor/sandbox.py` |
 | 失败自动重试与反思 | **结构化错误码**（timeout / network / rate_limited / upstream_5xx / auth / permission / not_found / invalid_args）驱动分类，不再依赖中文字符串嗅探；参数校验失败走自愈循环（配额按**单次调用**计）；运行期**瞬时**错误对声明 `retry_transient` 的只读工具做**指数退避原样重试**，上游给了 `Retry-After` 就**优先听它**；其余由 critic 按码分流：retryable→回决策 / plan_defect→重规划 / fatal→终止 | `app/core/errors.py` / `app/core/retry.py` / `_retry_transient` / `_classify_failure` |
 | 执行轨迹可视化 | 每个节点广播事件流落库；Web 时间线经 **SSE 推送**实时渲染（无轮询），工具参数/结果可折叠，计划进度 chip，token/步数进度条；轨迹可导出 JSON / Markdown | `web/index.html`、`GET /api/tasks/{id}/stream`、`/export` |
@@ -21,12 +22,14 @@
 | MCP 服务端 | `app/mcp_server.py` 以 **stdio** 传输实现 `tools/list` + `tools/call`，可被任意 MCP 客户端接入（Claude Desktop / `mcp` CLI 等）；工具的 `inputSchema` 直接复用 registry 的 JSON Schema，调用走 `registry.execute()`，沙箱与结构化错误码全部复用 | `python -m app.mcp_server` |
 | LangGraph 状态机持久化 | StateGraph 六节点 + 条件边，checkpointer 可插拔（SQLite/PG） | `app/graph/engine.py` `_build` |
 | Docker 沙箱隔离 | network_disabled + mem_limit + nano_cpus + pids_limit + read_only + tmpfs + uid 65534 | `DockerSandbox` |
-| 异步任务队列 | 默认进程内 asyncio 队列（零依赖）；生产切 Celery+Redis（`QUEUE_MODE=celery`） | `app/worker/local_queue.py`、`celery_app.py` |
+| 异步任务队列 | 默认进程内 asyncio 队列（零依赖）；生产切 Celery+Redis（`QUEUE_MODE=celery`），**Celery 任务体 / API 分发 / Redis broker 往返均有集成测试** | `app/worker/local_queue.py`、`celery_app.py` |
 | PostgreSQL 存储执行图 | 业务库 SQLAlchemy 异步（tasks/events 表），checkpoint 走 `langgraph-checkpoint-postgres` | `app/storage/` |
 | 上下文压缩 | 超阈值时滑动窗口 + LLM 摘要；工具关键输出实时写入 `key_outputs` 标记为不可压缩，每步注入 system | `app/core/compressor.py` |
 | 结构化校验与自愈循环 | jsonschema Draft 2020-12 校验 → 失败回喂 REPAIR 提示词 → 重校验 → 循环 | `app/tools/registry.py` `validate` |
 | 并发子 Agent 资源调度 | 任务级信号量（`MAX_CONCURRENT_TASKS`）+ 工具级信号量（`MAX_CONCURRENT_TOOLS`），一轮多工具 asyncio.gather 并行 | `local_queue.py` / `tool_executor_node` |
 | token/步数双维度预算 | 步数或 token 超限→降级便宜模型续跑一次→再超限则带已完成数据优雅终止 | `app/core/budget.py` |
+| 鉴权 / 多租户 / 限流 | API Key 鉴权（SHA-256 哈希落库，明文仅创建时返回一次）+ 租户隔离（跨租户一律 404）+ 四层额度判定：每 IP 每分钟 → 每租户每分钟 → 每租户/全局每日提交数 → 每租户每日 token 配额（实耗 + 在途预占，判定即查 tasks 表事实来源）；分钟级计数 `RATE_LIMIT_STORE` 双形态：memory 滑动窗口（单进程零库往返）/ **db 原子 UPSERT（多 worker 共享同一份额度）**；管理端点管理租户生命周期 | `app/api/security.py`、`app/api/ratelimit.py`、`app/api/routes_admin.py` |
+| 可观测性（trace + 指标 + 结构化日志） | **零依赖**手写 Prometheus exposition（`/metrics`，`text/plain; version=0.0.4`）+ W3C `traceparent` 入站透传/自生成 + `contextvars` 贯穿任务全链路 + JSON 结构化日志自动注入 `task_id`/`trace_id`；标签严守低基数纪律（任何 ID 都不做标签） | `app/observability/` |
 
 ## 二、量化指标（`python scripts/metrics.py` 实测）
 
@@ -106,8 +109,8 @@ python scripts/demo_cli.py --offline   # 全链路：ReAct → 并行工具 → 
 | Job | 内容 |
 |---|---|
 | `static` | `ruff --select E9,F63,F7,F82`（**F821 未定义名**，专拦"缺 import 导致导入期崩溃"）+ `compileall` + `import app.main` / `import app.worker.celery_app` 冒烟 |
-| `test` | 43 条离线用例，结果与机器无关 |
-| `integration` | Docker 沙箱 4 例（无挂载执行 / 出网被拦 / uid=65534 / 超时被杀）+ PostgreSQL checkpoint 2 例 |
+| `test` | 381 条离线用例（含注入 `SEARCH_PROVIDER=bing` 的对抗步骤），结果与机器无关 |
+| `integration` | Docker 沙箱 4 例（无挂载执行 / 出网被拦 / uid=65534 / 超时被杀）+ PostgreSQL checkpoint 2 例 + PG 租户列迁移 1 例 + **PG Alembic 自举 1 例**（历史库现场重建 → 补列 → stamp → 二次幂等）+ **Celery 路径 3 例（Redis 真实 broker 往返：API → Redis → 独立 worker 子进程 → DB；Celery+PG 存储形态）**（本地无 daemon 自动 skip，CI 上会真跑） |
 | `smoke` | CLI 全链路 / 崩溃恢复 / **指标门禁**（恢复率与自愈率断言 100%）；三步均注入敌对 `SEARCH_PROVIDER=bing`，断言脚本仍自报 `mock` —— 防止"离线脚本偷偷联网"复发 |
 
 ## 四、架构
@@ -147,13 +150,27 @@ python scripts/demo_cli.py --offline   # 全链路：ReAct → 并行工具 → 
 | POST | `/api/tasks` | 提交任务 `{goal, mode, max_steps, max_tokens}`，返回 task_id |
 | GET | `/api/tasks` / `/api/tasks/{id}` | 列表 / 详情（含断点位置 `checkpoint_next`） |
 | GET | `/api/tasks/{id}/trace` | 全量轨迹事件 |
+| GET | `/api/tasks/{id}/spans?kind=` | **span 树**（父子关系 + 每 span 自耗时 `self_ms`，可按 `task`/`step`/`llm`/`tool` 过滤） |
 | GET | `/api/tasks/{id}/events?after=N` | 增量轮询（保留给不支持 SSE 的环境；前端已改走 `/stream`） |
 | GET | `/api/tasks/{id}/stream` | **SSE 推送**轨迹事件 + 任务快照，终态后推 `stream_end` 并关闭 |
 | GET | `/api/tasks/{id}/export?format=json\|md` | 导出轨迹（结构化 JSON / 可贴进报告的 Markdown） |
 | POST | `/api/tasks/{id}/resume` | 从 checkpoint 恢复 |
 | POST | `/api/tasks/{id}/cancel` | 协作式取消（节点边界优雅收尾） |
 | GET | `/api/tools` | MCP `tools/list` 风格工具清单 |
-| GET | `/api/metrics` | token/步数/自愈/耗时聚合 |
+| GET | `/api/metrics` | token/步数/自愈/耗时聚合（**租户范围**，只见自己的数据） |
+| POST | `/api/admin/tenants` | 创建租户（明文 API Key **仅此一次**返回） |
+| GET | `/api/admin/tenants` | 租户列表（不含任何密钥字段） |
+| PATCH | `/api/admin/tenants/{id}` | 禁用/启用、调整每日 token 配额 |
+| POST | `/api/admin/tenants/{id}/rotate` | 轮换 API Key（旧 key 立即失效） |
+| GET | `/api/admin/tenants/{id}/usage` | 该租户今日配额用量（实耗 + 在途预占） |
+| GET | `/api/admin/metrics` | 全局指标（跨租户聚合，管理端点专用） |
+| GET | `/metrics` | **Prometheus exposition**（进程级低基数聚合，**不在 `/api` 前缀下**、无需鉴权，供抓取器每 15s 拉取） |
+
+**鉴权约定**：除 `/health`、`/metrics` 与静态页外，`/api/*` 一律要求 `X-API-Key` 请求头（也接受 `Authorization: Bearer`；SSE 端点额外接受 `?api_key=`，因 EventSource 无法设置请求头）。管理端点用独立的 `X-Admin-Key`。**零配置引导**：首次启动自动生成管理员密钥与 `default` 租户密钥，写入 `data/api_credentials.json`（env `ADMIN_API_KEY` 优先）；Web 页右上角填入租户 Key 即可使用。
+
+**trace 约定**：提交任务时可带标准 W3C `traceparent: 00-<trace-id>-<span-id>-<flags>` 头，运行时原样复用该 `trace_id`（接得上上游链路），并把入站的 `parent-id` 继承为本进程 root span 的父节点 —— 于是**跨进程也能拼成一棵树**；不带或格式非法则自动生成 32 位 hex。`trace_id` 落进每条事件（`events.trace_id`）与每条日志，审批恢复（`/approve`、`/reject`）视为**一次新的触发**，另起一条 trace。
+
+**span 约定**：不引入 OTel SDK（零依赖铁律、且本机无 collector 可验），互操作靠 **traceparent 线格式**而非 SDK。"父子耗时分解"是自建 span 树的理由 —— 只有 `trace_id` 贯穿时，你无法回答"这一秒到底花在哪"。四层埋点：`task`（根）→ `step`（react_step 每轮）→ `llm`（每次 `chat`）/ `tool`（每次工具调用）。`GET /api/tasks/{id}/spans` 返回嵌套树，每个节点带 `self_ms = duration_ms − Σ 直接子 span duration`（**只扣直接子**：孙辈耗时已在子辈 duration 里，再扣即重复扣）。聚合近似值：观测开销很小但非零，`self_ms` 之和 ≈ 根 span duration（实测守恒，`task 1241.45ms` 对 `Σself 1241.45ms`）。span 是**旁路观测**：落库失败只告警不影响任务（与工具执行流水的严格策略刻意相反）。
 
 ## 六、两种部署形态
 
@@ -179,10 +196,10 @@ docker compose up --build                        # PG + Redis + API + Celery wor
 
 ```bash
 python -m pytest tests/ -q
-# 179 个用例：173 条完全离线、可确定复现；6 条需 Docker daemon / PostgreSQL（不可用时自动 skip，CI 上会真跑）
+# 389 个用例：379 条完全离线、可确定复现；10 条需 Docker daemon / PostgreSQL / Redis（不可用时自动 skip，CI 上会真跑）
 ```
 
-覆盖：ReAct 循环与并行工具、Plan-Execute 与重规划、自愈循环（成功 / 耗尽降级 / **配额按调用计** / **并发不互相挤占**）、步数与 token 预算（含模型降级）、上下文压缩、checkpoint 跨引擎恢复、**工具执行流水幂等（真实崩溃窗口 + 对照组）**、**瞬时错误退避重试（闸门 / 上限 / 取消 / 真实等待）**、工具 Schema / 路径越狱 / SQL 只读、子 Agent 委托与递归防护、API 全生命周期、Docker 沙箱隔离、PostgreSQL checkpoint。
+覆盖：ReAct 循环与并行工具、Plan-Execute 与重规划、**计划 DAG（deps 解析双形态 / Kahn 分层 / 非法计划三级兜底 / 分批并行端到端 / critic 整批推进 / ReAct↔Plan 自适应升降级 / replan id 顺延唯一）**、**Alembic 迁移（全新库 upgrade / 旧库补列 stamp / 幂等 / 列集合防漂移对照）**、自愈循环（成功 / 耗尽降级 / **配额按调用计** / **并发不互相挤占**）、步数与 token 预算（含模型降级）、上下文压缩、checkpoint 跨引擎恢复、**工具执行流水幂等（真实崩溃窗口 + 对照组）**、**瞬时错误退避重试（闸门 / 上限 / 取消 / 真实等待）**、工具 Schema / 路径越狱 / SQL 只读、子 Agent 委托与递归防护、API 全生命周期、**鉴权（401/403 语义、key 哈希、轮换、禁用）、租户隔离、四层限流与配额、零配置引导、旧库迁移**、**可观测性（traceparent 解析与贯穿 / **完整 span 树（父子关系、自耗时只扣直接子、孤儿与自环兜底、异常路径也闭合、上下文还原）** / Prometheus 文本格式 / **直方图分桶单调性与可配分桶（非法值逐项跳过 / 全非法才回退默认）** / 结构化日志 / **脱敏（8 条规则 + 递归 extra/args/异常栈 + 幂等不变量）** / **采样（首条必留 / 每 N 条留 1 / WARNING 永不丢 / Filter 顺序）** / **进程身份指标（低基数标签 / build_info 恒为 1 / PROCESS_INSTANCE 构成）** / `/metrics` 无高基数标签）**、**Celery 路径（eager 任务体 / API 分发 / Redis 真实 broker 往返：API → Redis → 独立 worker 子进程 → DB / Celery+PG 存储形态）**、Docker 沙箱隔离、PostgreSQL checkpoint（含租户列迁移与 Alembic 自举的 PG 分支）。
 
 ## 八、目录结构
 
@@ -199,16 +216,20 @@ app/
   tools/registry.py    MCP 风格注册表（JSON Schema 校验 + retry_transient 声明）
   tools/*.py           web_search / get_weather / code_run / db_query / file_ops / subagent
   executor/sandbox.py  Docker 沙箱（本地受限子进程回退）
-  storage/             任务表 + 事件表 + **工具执行流水表（幂等去重）** + 仓储
+  storage/             任务表 + 事件表（含 trace_id）+ **工具执行流水表（幂等去重）** + **span 表（父子区间）** + 仓储
+  observability/       Prometheus 指标 + trace 上下文 + **span 树（自耗时分解）** + 结构化日志（**脱敏 + 采样**，零依赖）
   worker/              本地 asyncio 队列 + Celery worker
   api/                 FastAPI 路由
-  main.py              应用入口（lifespan 组装）
+  main.py              应用入口（lifespan 组装 + /metrics 端点）
 web/index.html         轨迹可视化（零依赖单页）
 sandbox/Dockerfile     代码执行沙箱镜像（python:3.11-slim 最小化）
 scripts/               CLI 演示 / 崩溃恢复演示 / 指标脚本 / Mock LLM / 种子库
-tests/                 179 个测试（173 离线 + 6 需 Docker/PG）
+migrations/            Alembic 迁移（baseline 由 autogenerate 生成 + async env）
+tests/                 389 个测试（379 离线 + 10 需 Docker/PG/Redis）
 docs/                  目标差距评估与 P0/P1 修复记录
 .github/workflows/     CI 四道门禁
+requirements.txt       直接依赖的兼容范围（`>=`）
+requirements.lock.txt  全量锁定版本，可复现安装（CI 使用）
 ```
 
 ## 九、面试深挖点（对应设计决策）
@@ -229,11 +250,53 @@ docs/                  目标差距评估与 P0/P1 修复记录
 14. **来源可信度必须成为模型可见的信号**：查「2025年NBA的FMVP是谁」时，搜索返回的 5 条**全部**是 UGC/内容农场（bilibili、今日头条、网易号），其中一条还是假设性标题（原文"如果今年勇士夺冠"被截成"勇士夺冠2025"）——模型把"雷霆夺冠""库里""勇士夺冠"三条**互不相干**的结果拼凑成"勇士逆转热火、库里获 FMVP"这种完全错误的结论，并自称"关键信息具有一致性"。
     修法有三层：① 工具给每条结果标注**来源可信度**（权威/门户媒体/UGC/未知名）与**内容标记**（推测性/标题党/引流），并在"没有权威来源"时显式警告；② 提示词写死**冲突判定顺序**（权威 > 门户媒体 > UGC）与**严禁拼凑**（某个人名/比分若在任何一条结果里都没被写出，就等于没有该证据）；③ 明确**不许以"预算不足"为由带着疑问给出确定答案**。
     另一处必须知道的分层：**"被反爬限流"与"页面结构变更"是完全不同的两件事**，前者等一会儿重试即可（报 `RATE_LIMITED` 可重试），后者才需要改解析器——混为一谈会让人改错地方。免 key 的网页抓取源天然脆弱（必应召回质量差、搜狗会限流），**生产环境应接正式搜索 API**。
+15. **优雅停机必须"先排空、后取消"**：给本地队列做停机排空时实测发现——任务若在 DB 操作中途被 cancel，`CancelledError` 会**打断 aiosqlite 连接的关闭流程**，SQLite 文件句柄在 C 层孤儿化：Python 对象全部显示已关闭、无线程存活、`gc` 扫描一无所获，但进程存活期间该库文件永远无法删除（Windows 上表现为测试临时目录清理报 WinError 32；Linux 因"打开的文件可删"被长期掩盖）。复现对照干净利落：提交任务后立即停机 **100% 泄漏**，等任务到终态再停机 **0% 泄漏**。修法是把 `queue.stop()` 从"发出 cancel 就返回"改成"先等在跑任务自然结束（`shutdown_drain_timeout_s`，默认 10s），超时才取消兜底"——这本来就是优雅停机应有的语义：让节点边界把状态落完，而不是半路掐断。
+16. **限流判定要用事实来源，而不是另建计数器**：日级额度（每租户/全局每日提交数、每日 token 配额）全部以 `tasks` 表实数聚合（提交数按 `created_at` 计数、token 用"已完成实耗 + 在途按 `max_tokens` 预占"），而不是像常见做法那样另建一张计数器表。理由：**判定依据即事实来源**，重启、多 worker、重复提交都不会漂移——姊妹项目 campus-assistant 的限流计数器曾因"内存判定 + 异步记账"实测超发 50%、又因"先读后写"在多进程下偶发超发 1 次，最后靠"单事务原子占位"才修稳；直接聚合事实表是更便宜且更不容易错的方案（代价是每次提交多两三条带索引的聚合查询，相对一次 LLM 调用可忽略）。分钟级突发控制是唯一没有事实表可聚合的层——它计的是"到达的请求"（含无效 key 撞库，不产生任务行），所以 `RATE_LIMIT_STORE` 给两种形态：**memory**（默认，单进程精确滑动窗口，零库往返）与 **db**（`rate_windows` 表 + 原子 UPSERT，多 worker 共享同一份额度）。db 形态有两个自觉的取舍：① 固定窗口在边界处最多放行 2×limit——跨进程滑动的标准做法是每 key 存全部命中时间戳（Redis ZSET 模式），映射到 SQL 就是每请求一行写放大，分钟级是软限制、资金护栏在日级 tasks 聚合，这个近似可接受；② 存储故障**放行**（fail-open）——DB 挂了随后的鉴权查询同样会失败，放行不产生额外越权面。窗口起点必须用**墙钟** `time.time()`：monotonic 各进程基准不同，跨进程不可比。
+17. **指标标签的基数纪律**：`task_id` / `tenant_id` / `trace_id` 这类 UUID 级取值**绝不能做标签**——每加一个唯一值就多一条时间序列，抓取器内存先于业务崩。所以 `/api/metrics` 是"按租户维度聚合的业务洞察"，`/metrics` 是"进程级低基数聚合"，两者定位不同、各自不可替代；`task_id` / `trace_id` 只进**事件表与日志**（它们是可按需查询的事实来源，不是维度）。另有两个容易漏的坑：① `/metrics` **有意不放在 `/api` 前缀下**——抓取器每 15s 拉一次且无法携带租户凭据，挂在 `/api` 下会被限流中间件拦掉；② **无样本的指标不输出**（而不是补一行假 0），否则 `rate()` / `sum()` 的计算会被污染。
+18. **trace 贯穿为什么用 `contextvars` 而不是 state 字段**：trace 是**请求级上下文**，不是**任务状态**。写进 `AgentState` 会让存量 checkpoint 反序列化后缺字段（LangGraph checkpoint 是单一事实来源，改形态等于破坏向后兼容），而 `contextvars` 天然随协程传递、`try/finally` 一行即还原。另一个必须显式绑定的原因：任务由**后台队列协程**拉起，`asyncio.create_task` 之后的上下文**不继承** HTTP 请求上下文，Celery 路径更是另一个进程——所以 `bind_trace` 落在 `run_task` / `resume_task` 内部，而不是写成 HTTP 中间件（那样两种队列形态都会漏）。
+19. **Prometheus 直方图的 `+Inf` 桶**：`+Inf` 桶必须**恒等于总观测数**，且各桶单调不减。第一版图省事拿"末桶计数"当总数，结果一旦出现超过最大桶边界（60s）的观测——LLM 超时重试后的长尾正是这种量级——`+Inf` 与 `_count` 双双漏计，`histogram_quantile()` 随之算错。修法是**单独维护总观测数**并加了"桶单调不减"的回归用例。这类缺陷单跑看不出来（正常耗时都落在桶内），只有边界值能逼出来。
+
+20. **"有 trace_id" ≠ "有 span 树"**：P2-5 只做到"每条事件/日志带同一个 trace_id"，这能回答"这次请求发生过什么"，但**回答不了"时间花在哪"**——日志是点，不是区间。补 span 树才有父子区间与自耗时分解（实测一次任务：`task 1241.45ms` 里 `tool 1170.93ms` 占 94%，`llm` 三层加起来 0.018ms，也就是说这一秒几乎全在等外部 HTTP，而不是模型推理）。自耗时公式有个易错点：**只扣直接子 span**，孙辈耗时已在子辈 duration 里；并行子之和还可能超过父，故取 `max(0, …)` 下界保护。
+21. **多 worker 下"进程内计数"会骗人**：`uvicorn --workers 4` 时四个进程各自导出一份 `/metrics`，Prometheus 按 `instance` 去重。若 `instance` 相同（同 host 同端口），四份序列**互相覆盖**，表现为计数随机跳动；若进程重启，计数器归零又会让 `rate()` 出现假尖峰。修法是导出**进程身份指标**——`agent_build_info{version,pid}` + `agent_process_start_time_seconds{pid}`，并约定抓取时用 `PROCESS_INSTANCE`（`host:pid:start`，也是把 PID 换算成 uptime 的标准做法）做 `instance` 标签，让每个进程成为独立序列。`pid` 是**低基数**标签（进程数有限、且有界），与 `task_id` 这类 UUID 级标签有本质区别。
+22. **脱敏正则的"顺序 + 偏移基准"双陷阱**：一次探针实测抓到两个真缺陷。① **顺序**：宽泛的 `key[:=]value` 规则若排在连接串规则之前，`postgres://admin:hunter2secret@db/app` 会被中间的 `secret` 字样触发，输出 `postgres=[REDACTED]db/app`——密码遮蔽了，但**方案名被吃掉**，日志失去"连的是哪个库"这个排查信息；② **偏移基准**：替换函数若从文本 0 起切片（而非从 `m.start()` 起），会把 match 之前的整段前缀再抄一遍，`"连接串 postgres://a:pw@db"` 变成 `"连接串 连接串 postgres://a:[REDACTED]@db"`——结构被破坏，**且替换不幂等**。第 ② 点的通用守护是"幂等性断言"：结构破坏类缺陷很难逐条穷尽，但 `f(f(x)) == f(x)` 是它们共同的必要性质，一条参数化用例就能覆盖全部 8 条默认规则。
+23. **日志采样绝不能丢错误**：高吞吐下每步工具执行都打一条 INFO 会让日志量随任务数线性增长。但采样策略若一刀切按比例丢，**唯一一条错误日志也可能被丢掉**——等于把现场销毁。所以规则是三条：`WARNING` 及以上**永不采样**、每个 `(logger, level)` 的**首条必留**（否则"某模块开始报日志"这个事件本身不可见，看起来像模块没启动）、之后每 N 条留 1 条。另用**计数器而非随机数**：随机采样在低日志量下可能连续丢弃，观测不稳定；计数器在任意量级下行为可预期、可测试（无 flaky）。
+24. **schema 迁移交给 Alembic 的三个关键点**：手写幂等 ALTER 在"加列"时代够用，但它对**列类型变更、约束调整、漏写幂等分支**没有任何防线，且脚本与 `models.py` 会随时间漂移。接入时做了三件事：① **baseline 不手抄**——对空临时库跑 autogenerate 从 `Base.metadata` diff 出 0001，再配一条"upgrade 后列集合 == metadata 列集合"的对照用例让 CI 持续把关（改了模型忘写迁移 → 用例当场红）；② **三路径自举**而不是只认一种现场——全新库走 `upgrade head`，存量旧库（有业务表、无 `alembic_version`）先按旧逻辑补列再 `stamp head`（旧行为逐字保留，升级不增风险），已版本化库是幂等空操作；③ **async 引擎零新驱动**——env.py 手工实现官方 async 模板（`create_async_engine` + `run_sync`），SQLite/PG 两条 URL 直接可用，CLI 与运行时（programmatic 注入真实 engine URL，避免读 `.env` 的漂移）共用同一套脚本。
+25. **计划 DAG 化的兼容设计比功能本身更重要**：让 planner 输出图结构容易，让**旧数据不炸**才是难点。三个决策：① `deps` 键**缺省 = 线性链**（依赖列表上一步）而不是缺省无依赖——旧 prompt 输出与旧 checkpoint 里没有这个键，语义自动等价原有串行执行，零迁移；模型若守新提示词给 `deps: []` 才并行，模型漏写 deps 宁可串行也不乱序并行。② 非法计划（id 重复 / 引用不存在 / 环）走**三级兜底**：DAG 分层 → 删 deps 退化为线性链 → 逐步分层——宁可串行不崩，因为旧 checkpoint 里 replan 重用 `s1..sn` 产生的重复 id 是真实存在的存量数据（DAG 时代 id 是依赖引用键，replan 改为接续旧计划最大编号顺延，rename map 同步改写 deps）。③ ReAct↔Plan **双向自适应**：react 重规划成功 → 升级 plan_execute（修复"react 重规划产出的计划没有执行轨道"的旧缺口）；plan_execute 连续 plan_defect 达阈值（默认 2）→ 降级 react 并把 error_kind 改记 retryable（走 compressor 而非再回 planner 空转烧 token）——计划被反复证明不可行时，把决策权交还模型自由推理，成本上这比无限重规划便宜。
 
 ## 十、与需求文档的模块对照
 
 M1 执行内核（`demo_cli.py`）→ M2 状态持久化（`demo_crash_recovery.py`）→ M3 沙箱与自愈（`sandbox.py`）→ M4 异步并发（双队列）→ M5 成本预算（双维度 + 降级）→ M6 观测产品化（事件流 + Web 时间线）。**M1–M6 已全部落地**。
 
 在 M1–M6 之上又补了三层"负面路径"能力：**工具执行流水幂等**（恢复不重复执行）、**瞬时错误指数退避重试**（只对声明 `retry_transient` 的只读工具）、**自愈配额按调用计 + 并发安全**。
+
+再往上一层是**可观测性产品化**（P2-5）：Prometheus 指标导出 + W3C traceparent 贯穿 + JSON 结构化日志。这一层刻意**零新依赖**——exposition 文本格式是稳定的公开协议（约 100 行实现），引入 `prometheus-client` 反而要同步改 `requirements.lock.txt` / CI 锁定门禁 / Dockerfile，收益与改动面不成正比。
+
+同一层的第二批（**P2-6**）把 P2-5 留下的三个"能观测但不够用"补成真的：**真正的 span 树**（父子区间 + 自耗时分解，不再只有 trace_id 贯穿）、**多 worker 聚合**（进程身份指标 + `instance` 标签约定）、**日志采样与脱敏**（写入前遮蔽密钥/PII + 采样永不丢错误）+ **直方图分桶可配**（不再硬编码）。
+
+**抓取配置（多 worker）**：
+
+```yaml
+# prometheus.yml
+scrape_configs:
+  - job_name: agent-runtime
+    static_configs:
+      #  同一进程的序列必须用不同 instance，否则多 worker 日志/计数互相覆盖
+      - targets: ["127.0.0.1:8000"]
+    #  若前面还有反代，用 relabel 把 instance 换成 host:pid:start（见下）
+```
+
+运行时的 `PROCESS_INSTANCE` 值（`hostname:pid:start_time`）可直接作为 `instance` 标签，也是把 PID 换算成进程 uptime 的标准做法（`time() - agent_process_start_time_seconds`）。多 worker 下 `uvicorn --workers N` 的每个进程都会导出自己那份 `/metrics`，因此**抓取侧必须能区分进程**——这是 P2-6 要解决的核心问题，而非应用侧建共享计数器。
+
+**可观测性环境变量**：
+
+| 变量 | 默认 | 说明 |
+|---|---|---|
+| `LOG_REDACT_ENABLED` | `true` | 关闭脱敏（仅本地排查用；生产勿关） |
+| `LOG_REDACT_PATTERNS` | `""` | 逗号分隔的自定义正则；覆盖默认 8 条 |
+| `LOG_SAMPLE_RATE` | `1` | 每 N 条 INFO 留 1 条；`<=1` 关闭采样；**WARNING 及以上永不采样** |
+| `SPANS_ENABLED` | `true` | 关闭 span 采集（省一次落库） |
+| `SPANS_MAX_PER_TASK` | `500` | 单任务 span 上限，超出截断并告警（防长任务撑爆表） |
+| `METRICS_BUCKETS_TASK` / `_LLM` / `_TOOL` | `""` | 逗号或空格分隔的分桶边界；留空用内置 workload profile（13 档） |
+
 
 各模块的差距评估、优先级路线图与逐项修复记录见 [`docs/Agent运行时-差距评估与完善建议.md`](docs/Agent运行时-差距评估与完善建议.md)。

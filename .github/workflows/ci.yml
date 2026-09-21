@@ -56,7 +56,7 @@ jobs:
       - name: 安装依赖
         run: |
           python -m pip install --upgrade pip
-          pip install -r requirements.txt
+          pip install -r requirements.lock.txt
           pip install "ruff==0.16.7"
 
       # 关键规则集：E9(语法错误) F63 F7 F82(未定义名)
@@ -73,10 +73,54 @@ jobs:
           python -c "import app.main; print('app.main OK')"
           python -c "import app.worker.celery_app; print('celery_app OK')"
 
+      # 依赖锁定门禁：requirements.lock.txt 必须与 requirements.txt 自洽。
+      # 存在意义：声明是 `>=`（表达兼容范围），锁定是 `==`（表达已知可用组合）。
+      # 两者一旦脱钩，CI 装的就不是本地验证过的版本 —— 全绿也说明不了问题。
+      # 实测漂移：openai 声明 1.50 / 本地实装 3.14.1 / pip 当前解析 3.16.2；
+      # langgraph 声明 0.2.60 / 实装 1.2.11。跨大版本改 checkpoint 序列化格式
+      # 会让「断点恢复」静默失效，必须由门禁兜住。
+      - name: 依赖锁定一致性门禁
+        run: |
+          python - <<'PY'
+          import pathlib, re, sys
+          from packaging.requirements import Requirement
+          from packaging.version import Version
+
+          def name_of(spec):
+              return re.split(r"[><=!\[;]", spec, maxsplit=1)[0].strip().lower().replace("_", "-")
+
+          lock = {}
+          for line in pathlib.Path("requirements.lock.txt").read_text(encoding="utf-8").splitlines():
+              line = line.strip()
+              if line and not line.startswith("#"):
+                  m = re.match(r"^([A-Za-z0-9_.\-]+)==([^\s;]+)", line)
+                  if not m:
+                      sys.exit(f"锁定行格式异常: {line}")
+                  lock[name_of(m.group(1))] = m.group(2)
+
+          declared = [l.strip() for l in pathlib.Path("requirements.txt").read_text(encoding="utf-8").splitlines()
+                      if l.strip() and not l.strip().startswith("#")]
+
+          missing = [d for d in declared if name_of(d) not in lock]
+          if missing:
+              sys.exit(f"锁定文件未覆盖直接依赖: {missing}")
+
+          bad = []
+          for d in declared:
+              req = Requirement(d)
+              n = name_of(d)
+              if not req.specifier.contains(Version(lock[n]), prereleases=True):
+                  bad.append(f"{d} -> 锁定 {lock[n]} 越界")
+          if bad:
+              sys.exit(f"锁定版本越出兼容范围: {bad}")
+
+          print(f"锁定自洽：{len(declared)} 个直接依赖 / {len(lock)} 条锁定")
+          PY
+
   # ── 门禁 2：离线单元测试（确定性，任何机器结果一致） ──────────────
-  # 179 条用例中，173 条完全离线；排除的 6 条需要 Docker/PostgreSQL，见 integration job。
+  # 389 条用例中，379 条完全离线；余下 10 条需要 Docker/PostgreSQL/Redis，见 integration job。
   test:
-    name: 单元测试 · 173 例离线套件
+    name: 单元测试 · 381 例离线套件
     runs-on: ubuntu-latest
     needs: static
     steps:
@@ -90,7 +134,7 @@ jobs:
       - name: 安装依赖
         run: |
           python -m pip install --upgrade pip
-          pip install -r requirements.txt
+          pip install -r requirements.lock.txt
 
       # 不加 -p no:randomly 之类的花活；全量收集，出现收集错误即失败。
       - name: pytest（离线套件）
@@ -98,6 +142,23 @@ jobs:
           python -m pytest tests/ -q --no-header \
             --ignore=tests/test_docker_sandbox.py \
             --ignore=tests/test_postgres_checkpoint.py
+
+      # 测试数下限门禁：README 里的用例数曾被改漏（193 / 206 / 197 三处互相矛盾），
+      # 数字对不齐会直接削弱"用数据说话"的可信度。收集数低于阈值即失败，
+      # 逼着改动者在删用例时同步文档。
+      # 计数方式：--collect-only -q 每行一个用例、行内含 `::`；末尾汇总行不含 `::`，
+      # 所以 grep -c '::' 恰好等于用例数。
+      # 口径（实测 2026-09-21，排除 docker/postgres 两个文件后）：收集 381 = 379 passed
+      #   + 2 skipped（test_celery_path 里两条需 Docker 的用例，本机无 daemon 而 skip）。
+      # 阈值随套件增长单调上调，绝不下调 —— 下调等于给"删用例"开口子。
+      - name: 测试数门禁（离线收集数不得低于 379）
+        run: |
+          n=$(python -m pytest tests/ --collect-only -q \
+            --ignore=tests/test_docker_sandbox.py \
+            --ignore=tests/test_postgres_checkpoint.py 2>&1 \
+            | grep -c '::' || true)
+          echo "离线套件收集到 $n 个用例（阈值 379）"
+          test "$n" -ge 379 || { echo "用例数低于 379，请同步 README / CI 中的数字"; exit 1; }
 
       # 对抗性门禁：注入敌对 provider，证明套件真的封闭（不依赖 .env 的 SEARCH_PROVIDER）。
       # 曾发生过的事故：conftest 只冻结了模型层，SEARCH_PROVIDER 回落到 .env 的 bing，
@@ -112,12 +173,17 @@ jobs:
             --ignore=tests/test_postgres_checkpoint.py
 
   # ── 门禁 3：集成测试（需要 Docker daemon，ubuntu runner 自带） ─────
-  # 这两组用例在本地无 Docker 环境时会被 pytest.skip，所以长期没有被真正执行过。
-  # 放到 CI 上跑，是「沙箱隔离」与「PostgreSQL checkpoint」两个卖点的唯一实测来源：
+  # 这三组用例在本地无 Docker 环境时会被 pytest.skip，所以长期没有被真正执行过。
+  # 放到 CI 上跑，是「沙箱隔离」「PostgreSQL checkpoint」「Celery+PG+Redis 生产链路」
+  # 三个卖点的唯一实测来源：
   #   test_docker_sandbox        断言无挂载可执行 / 出网被拦 / uid=65534 / 超时被杀
-  #   test_postgres_checkpoint   拉一次性 postgres:16-alpine，验证 asyncpg+psycopg 双通道与重连落盘
+  #   test_postgres_checkpoint   拉一次性 postgres:16-alpine，验证 asyncpg+psycopg 双通道、
+  #                              重连落盘，以及租户列迁移的 PG 分支
+  #   test_celery_path           Celery 任务体（eager）+ API 分发（离线部分随 test job 跑）、
+  #                              Redis 真实 broker 往返（API → Redis → 独立 worker 子进程 → DB）、
+  #                              Celery + PG 业务库/checkpoint 形态
   integration:
-    name: 集成测试 · Docker 沙箱 + PostgreSQL checkpoint
+    name: 集成测试 · Docker 沙箱 + PostgreSQL + Celery/Redis
     runs-on: ubuntu-latest
     needs: static
     steps:
@@ -131,20 +197,21 @@ jobs:
       - name: 安装依赖
         run: |
           python -m pip install --upgrade pip
-          pip install -r requirements.txt
+          pip install -r requirements.lock.txt
 
       - name: 预拉取镜像（便于在日志里区分「拉镜像失败」与「断言失败」）
         run: |
           docker pull python:3.11-slim
           docker pull postgres:16-alpine
+          docker pull redis:7-alpine
 
       - name: 预构建沙箱镜像
         run: docker build -t agent-sandbox:latest ./sandbox
 
-      - name: pytest（Docker / PostgreSQL 集成）
+      - name: pytest（Docker / PostgreSQL / Celery 集成）
         run: |
           python -m pytest tests/test_docker_sandbox.py tests/test_postgres_checkpoint.py \
-            -q --no-header -rs
+            tests/test_celery_path.py -q --no-header -rs
 
   # ── 门禁 4：端到端冒烟（把 README 的能力声明变成 CI 事实） ─────────
   smoke:
@@ -162,7 +229,7 @@ jobs:
       - name: 安装依赖
         run: |
           python -m pip install --upgrade pip
-          pip install -r requirements.txt
+          pip install -r requirements.lock.txt
 
       - name: 初始化演示业务库
         run: python scripts/seed_demo_db.py
