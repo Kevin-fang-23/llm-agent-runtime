@@ -60,8 +60,11 @@ async def test_recursion_blocked(settings, registry):
     child_script = [
         # 子 Agent 试图再派生下一级：其注册表里没有 subagent → 未知工具
         {"tool": {"name": "subagent", "arguments": {"task": "再嵌套"}}},
-        # critic 判 plan_defect → 重规划 → 直接检索完成
+        # critic 判 plan_defect → 重规划 → 直接检索完成。
+        # P2-DAG 起 react 重规划成功会**升级为 plan_execute**（计划获得执行轨道），
+        # 因此交付走 finisher 的计划汇总分支 —— 比旧版多一次 LLM 调用，脚本补足。
         {"text": '{"steps": ["直接检索完成子任务"]}'},
+        {"final": "子任务改用直接检索完成"},
         {"final": "子任务改用直接检索完成"},
     ]
     sub_registry = build_subagent_registry(settings, llm_factory=lambda: FakeScriptedLLM(list(child_script)))

@@ -15,7 +15,7 @@ from typing import Any, Callable
 
 from app.config import Settings, get_settings
 from app.core.llm import ChatLLM, OpenAIChatLLM
-from app.graph.engine import AgentEngine, EventSink, ToolJournal
+from app.graph.engine import AgentEngine, EventSink, SpanSink, ToolJournal
 from app.tools.factory import build_default_registry
 
 
@@ -84,18 +84,22 @@ async def build_engine(
     llm: ChatLLM | None = None,
     registry=None,
     journal: ToolJournal | None = None,
+    span_sink: SpanSink | None = None,
 ) -> AgentEngine:
     llm = llm or build_llm(settings)
     registry = registry or build_default_registry(settings, llm=llm)
     return AgentEngine(settings=settings, llm=llm, registry=registry,
-                       event_sink=event_sink, saver=saver, journal=journal)
+                       event_sink=event_sink, saver=saver, journal=journal,
+                       span_sink=span_sink)
 
 
 async def build_engine_with_saver(settings: Settings, event_sink: EventSink | None = None,
-                                 journal: ToolJournal | None = None):
+                                 journal: ToolJournal | None = None,
+                                 span_sink: SpanSink | None = None):
     """一次性构建并持有 saver（Celery 任务运行用）。返回 (engine, closer)。"""
     saver, closer = await build_saver(settings)
-    engine = await build_engine(settings, event_sink=event_sink, saver=saver, journal=journal)
+    engine = await build_engine(settings, event_sink=event_sink, saver=saver,
+                                journal=journal, span_sink=span_sink)
     return engine, closer
 
 
@@ -103,17 +107,20 @@ class EngineHolder:
     """进程内长驻引擎（FastAPI 本地队列模式）：持有 saver 生命周期，启动时构建。
 
     llm/registry 由外部传入（与 /api/tools 展示的注册表保持同一实例），
-    不传则按配置自动构建。journal 传 Repository（工具执行流水，防恢复时重复执行）。
+    不传则按配置自动构建。journal 传 Repository（工具执行流水，防恢复时重复执行）；
+    span_sink 同样传 Repository（span 树落库，见 app/observability/spans.py）。
     """
 
     def __init__(self, settings: Settings, event_sink: EventSink | None = None,
                  llm: ChatLLM | None = None, registry=None,
-                 journal: ToolJournal | None = None):
+                 journal: ToolJournal | None = None,
+                 span_sink: SpanSink | None = None):
         self.settings = settings
         self.event_sink = event_sink
         self.llm = llm
         self.registry = registry
         self.journal = journal
+        self.span_sink = span_sink
         self.engine: AgentEngine | None = None
         self._closer: Callable[[], Any] | None = None
 
@@ -121,7 +128,7 @@ class EngineHolder:
         saver, self._closer = await build_saver(self.settings)
         self.engine = await build_engine(self.settings, event_sink=self.event_sink,
                                          saver=saver, llm=self.llm, registry=self.registry,
-                                         journal=self.journal)
+                                         journal=self.journal, span_sink=self.span_sink)
 
     async def close(self) -> None:
         if self._closer is not None:

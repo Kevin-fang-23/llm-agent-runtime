@@ -157,7 +157,14 @@ echo "[3/6] 正在检查依赖..."
 if "${PY}" -c "${DEPS_CHECK}" >/dev/null 2>&1; then
   echo "       依赖已齐全，无需安装。"
 else
-  echo "       依赖缺失，正在自动安装（pip install -r requirements.txt）..."
+  # 优先用锁定文件：声明文件是 `>=`，装出来的版本随上游漂；
+  # lock 是本地验证过的组合（详见 requirements.lock.txt 头部注释）。
+  if [[ -f "${PROJECT_ROOT}/requirements.lock.txt" ]]; then
+    REQ_FILE="${PROJECT_ROOT}/requirements.lock.txt"
+  else
+    REQ_FILE="${PROJECT_ROOT}/requirements.txt"
+  fi
+  echo "       依赖缺失，正在自动安装（pip install -r $(basename "${REQ_FILE}")）..."
   echo "       这一步需要联网，首次安装可能需要几分钟，请耐心等待。"
   echo
   if [[ "${PKG_MANAGER}" == "poetry" ]]; then
@@ -169,12 +176,12 @@ else
       exit 1
     }
   else
-    "${PY}" -m pip install -r "${PROJECT_ROOT}/requirements.txt" || {
+    "${PY}" -m pip install -r "${REQ_FILE}" || {
       echo
       echo "[错误] 依赖安装失败。"
       echo "       常见原因与处理："
       echo "         1. 网络不通 —— 可改用国内镜像源后重试："
-      echo "            ${PY} -m pip install -r requirements.txt -i https://pypi.tuna.tsinghua.edu.cn/simple"
+      echo "            ${PY} -m pip install -r $(basename "${REQ_FILE}") -i https://pypi.tuna.tsinghua.edu.cn/simple"
       echo "         2. 权限不足 —— 建议改用虚拟环境，而不是直接加 sudo；"
       echo "         3. Python 版本过低 —— 本项目需要 Python 3.11 及以上。"
       echo

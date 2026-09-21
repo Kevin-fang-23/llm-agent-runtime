@@ -1,11 +1,12 @@
-"""PostgreSQL checkpoint 集成测试（M2 完整模式验证）。
+"""PostgreSQL 集成测试（M2 完整模式验证）。
 
 自动用 Docker 拉起一次性 postgres:16-alpine，验证：
   - AsyncPostgresSaver 连接池 + setup 建表；
   - 业务库走 asyncpg、checkpoint 走 psycopg 的双通道写入；
-  - 跨引擎实例的断点恢复（与 SQLite 用例同构）。
+  - 跨引擎实例的断点恢复（与 SQLite 用例同构）；
+  - 旧库迁移：tenant_id 列在 PG 上按 information_schema 探测补齐（附九 AL 的 PG 分支）。
 
-Docker daemon 或镜像不可用时自动跳过。
+Docker daemon 或镜像不可用时自动跳过（pg_url 夹具在 conftest）。
 """
 from __future__ import annotations
 
@@ -15,15 +16,13 @@ from app.config import get_settings
 from app.runtime import build_saver
 from tests.conftest import make_engine
 
-PG_PORT = 55432
-PG_IMAGE = "postgres:16-alpine"
 
-
-@pytest.fixture
+@pytest.fixture(scope="module")
 def event_loop_policy():
     """pytest-asyncio 官方机制：仅本模块的测试循环用 SelectorEventLoop（psycopg 要求）。
 
     其余模块保持默认 ProactorEventLoop（LocalSandbox 的 subprocess 依赖它）。
+    pg_url 夹具在 conftest（与 Celery+PG 用例共用）。
     """
     import asyncio
     import sys
@@ -31,48 +30,6 @@ def event_loop_policy():
     if sys.platform == "win32":
         return asyncio.WindowsSelectorEventLoopPolicy()
     return asyncio.get_event_loop_policy()
-
-
-@pytest.fixture(scope="module")
-def pg_url():
-    try:
-        import docker as docker_sdk
-
-        client = docker_sdk.from_env()
-    except Exception as e:  # noqa: BLE001
-        pytest.skip(f"Docker 不可用，跳过 Postgres 集成测试: {e}")
-    try:
-        client.images.get(PG_IMAGE)
-    except Exception:
-        try:
-            client.images.pull(PG_IMAGE)
-        except Exception as e:  # noqa: BLE001
-            pytest.skip(f"无法获取 {PG_IMAGE} 镜像: {e}")
-
-    name = "agent-pg-test"
-    try:
-        client.containers.get(name).remove(force=True)
-    except Exception:
-        pass
-    container = client.containers.run(
-        PG_IMAGE, name=name, detach=True,
-        environment={"POSTGRES_USER": "agent", "POSTGRES_PASSWORD": "agent", "POSTGRES_DB": "agent"},
-        ports={"5432/tcp": ("127.0.0.1", PG_PORT)},
-        auto_remove=False,
-    )
-    import time
-
-    try:
-        for _ in range(30):
-            code, _ = container.exec_run(["pg_isready", "-U", "agent"])
-            if code == 0:
-                break
-            time.sleep(0.5)
-        else:
-            pytest.skip("postgres 容器未在超时内就绪")
-        yield f"postgresql+asyncpg://agent:agent@127.0.0.1:{PG_PORT}/agent"
-    finally:
-        container.remove(force=True)
 
 
 async def test_postgres_checkpoint_run_and_resume(settings, registry, pg_url):
@@ -124,3 +81,91 @@ async def test_postgres_saver_survives_reconnect(settings, registry, pg_url):
         assert final["status"] == "done" and final["final_answer"] == "第一会话完成"
     finally:
         await closer2()
+
+
+async def test_postgres_schema_migration_adds_tenant_id(settings, pg_url):
+    """旧库迁移的 PG 分支：information_schema 探测 → ALTER TABLE 补 tenant_id → 历史任务归属为空。
+
+    SQLite 分支由 tests/test_auth_multitenant.py 的迁移用例覆盖；此前的 PG 分支零实测。
+    """
+    from sqlalchemy import text
+
+    from app.storage.models import make_engine_and_session
+    from app.storage.repository import Repository
+
+    engine, session_factory = make_engine_and_session(pg_url)
+    try:
+        async with engine.begin() as conn:
+            await conn.execute(text("""
+                CREATE TABLE tasks (
+                    id VARCHAR(40) PRIMARY KEY, goal TEXT, mode VARCHAR(20),
+                    status VARCHAR(20), max_tokens INTEGER, max_steps INTEGER,
+                    tokens_used INTEGER, steps_used INTEGER, downgraded BOOLEAN,
+                    selfheal_count INTEGER, result TEXT, error TEXT,
+                    duration_s DOUBLE PRECISION, created_at DOUBLE PRECISION,
+                    updated_at DOUBLE PRECISION
+                )"""))
+            await conn.execute(text(
+                "INSERT INTO tasks (id, goal, mode, status) "
+                "VALUES ('pg-legacy', '历史任务', 'react', 'done')"))
+
+        repo = Repository(session_factory)
+        await repo.create_tables()   # create_all 建 tenants/events/流水表 + 迁移补列
+        await repo.create_tables()   # 幂等：重复执行不报错
+
+        legacy = await repo.get_task("pg-legacy")
+        assert legacy is not None and legacy["tenant_id"] == ""
+        await repo.create_task("pg-new", "新任务", "react", 1000, 5, tenant_id="t-pg")
+        owned = await repo.get_task("pg-new", tenant_id="t-pg")
+        assert owned is not None and owned["tenant_id"] == "t-pg"
+    finally:
+        await engine.dispose()
+
+
+async def test_postgres_migrations_alembic_bootstrap(settings, pg_url):
+    """Alembic 迁移的 PG 分支（P2-Alembic）：旧库引导补列 + stamp head + 幂等空操作。
+
+    SQLite 分支由 tests/test_migrations.py 覆盖；PG 特有的是 asyncpg 驱动下的
+    alembic async env（env.py 自起 asyncio.run）与 information_schema 探测，
+    只有真库能验证 —— stamp/upgrade 都要走一遍完整连接，两条命令即两种驱动路径。
+    模块内其他用例会先建表，这里先清掉版本表与 tasks 重建"历史现场"，保持自洽。
+    """
+    from sqlalchemy import text
+
+    from app.storage.models import make_engine_and_session
+    from app.storage.repository import Repository
+
+    engine, session_factory = make_engine_and_session(pg_url)
+    try:
+        async with engine.begin() as conn:
+            await conn.execute(text("DROP TABLE IF EXISTS alembic_version"))
+            await conn.execute(text("DROP TABLE IF EXISTS tasks CASCADE"))
+            await conn.execute(text("""
+                CREATE TABLE tasks (
+                    id VARCHAR(40) PRIMARY KEY, goal TEXT, mode VARCHAR(20),
+                    status VARCHAR(20), max_tokens INTEGER, max_steps INTEGER,
+                    tokens_used INTEGER, steps_used INTEGER, downgraded BOOLEAN,
+                    selfheal_count INTEGER, result TEXT, error TEXT,
+                    duration_s DOUBLE PRECISION, created_at DOUBLE PRECISION,
+                    updated_at DOUBLE PRECISION
+                )"""))
+            await conn.execute(text(
+                "INSERT INTO tasks (id, goal, mode, status) "
+                "VALUES ('pg-mig-legacy', '迁移前任务', 'react', 'done')"))
+
+        repo = Repository(session_factory)
+        await repo.create_tables()   # legacy 路径：create_all + 补列 + stamp head
+        await repo.create_tables()   # versioned 路径：upgrade head 空操作（幂等）
+
+        rows = (await (await engine.connect()).execute(
+            text("SELECT version_num FROM alembic_version"))).all()
+        assert rows and rows[0][0] == "0001"
+
+        legacy = await repo.get_task("pg-mig-legacy")
+        assert legacy is not None and legacy["tenant_id"] == ""
+        await repo.create_task("pg-mig-new", "迁移后任务", "react", 1000, 5,
+                               tenant_id="t-mig")
+        owned = await repo.get_task("pg-mig-new", tenant_id="t-mig")
+        assert owned is not None and owned["tenant_id"] == "t-mig"
+    finally:
+        await engine.dispose()

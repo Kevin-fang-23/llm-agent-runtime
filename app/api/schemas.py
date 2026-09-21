@@ -10,6 +10,19 @@ class TaskCreate(BaseModel):
                       description="执行策略：react | plan_execute")
     max_tokens: int | None = Field(default=None, ge=500, le=5_000_000)
     max_steps: int | None = Field(default=None, ge=2, le=200)
+    require_approval: bool = Field(default=False,
+                                   description="HITL：每轮工具执行前挂起等待人工审批")
+
+
+class TenantCreate(BaseModel):
+    name: str = Field(min_length=1, max_length=80)
+    daily_token_quota: int | None = Field(default=None, ge=0,
+                                          description="每日 token 配额；缺省用全局默认值，0 = 不限")
+
+
+class TenantPatch(BaseModel):
+    enabled: bool | None = None
+    daily_token_quota: int | None = Field(default=None, ge=0)
 
 
 class TaskOut(BaseModel):

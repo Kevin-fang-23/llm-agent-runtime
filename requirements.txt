@@ -4,6 +4,7 @@ pydantic>=2.8
 pydantic-settings>=2.4
 sqlalchemy[asyncio]>=2.0.30
 aiosqlite>=0.20
+alembic>=1.13
 langgraph>=0.2.60
 langgraph-checkpoint-sqlite>=2.0.0
 langgraph-checkpoint-postgres>=2.0

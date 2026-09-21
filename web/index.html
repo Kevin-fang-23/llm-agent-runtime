@@ -40,6 +40,9 @@
   .status.queued { background: #33290f; color: var(--yellow); }
   .status.budget_exceeded { background: #33290f; color: var(--yellow); }
   .status.canceled { background: #2a2f3e; color: var(--muted); }
+  .status.waiting_approval { background: #2d1f47; color: #c9a6ff; }
+  .ev.t-approval_granted, .ev.t-approval_rejected { border-left-color: #c9a6ff; }
+  .ev.t-approval_granted .type, .ev.t-approval_rejected .type { color: #c9a6ff; }
   .main { overflow-y: auto; padding: 18px 22px; }
   .goal-box { background: var(--panel); border: 1px solid var(--border); border-radius: 10px; padding: 14px 16px; margin-bottom: 16px; }
   .goal-box .label { color: var(--muted); font-size: 12px; margin-bottom: 6px; }
@@ -85,6 +88,8 @@
   <h1>LLM Agent Runtime</h1>
   <span class="sub">自然语言目标 → 自主规划 → 工具执行 → 交付</span>
   <div id="metrics"></div>
+  <input id="apikey" type="password" placeholder="API Key（X-API-Key）" autocomplete="off"
+         style="width:200px;background:var(--panel2);border:1px solid var(--border);color:var(--text);border-radius:6px;padding:5px 8px;font-size:12px">
 </header>
 <div class="layout">
   <aside class="sidebar">
@@ -110,6 +115,8 @@
         <div id="d-bars" style="margin-top:8px"></div>
         <div id="d-plan" style="margin-top:8px"></div>
         <div class="actions">
+          <button class="ghost" onclick="approveTask()" id="btn-approve" style="display:none;border-color:#c9a6ff;color:#c9a6ff">✓ 批准执行</button>
+          <button class="ghost" onclick="rejectTask()" id="btn-reject" style="display:none;border-color:#e5604c;color:#e5604c">✗ 拒绝</button>
           <button class="ghost" onclick="resumeTask()">从断点恢复</button>
           <button class="ghost" onclick="cancelTask()">取消任务</button>
           <button class="ghost" onclick="exportTrace('json')">导出 JSON</button>
@@ -125,8 +132,35 @@
 let currentId = null, lastSeq = -1, pollTimer = null;
 const evPayload = e => JSON.stringify(e.payload);
 
+// ---- API Key：header 输入框，存 localStorage，所有请求自动携带 ----
+const keyInput = document.getElementById('apikey');
+keyInput.value = localStorage.getItem('agent_api_key') || '';
+keyInput.addEventListener('change', () => {
+  localStorage.setItem('agent_api_key', keyInput.value.trim());
+  refreshList().catch(() => {});
+});
+const theKey = () => keyInput.value.trim();
+function authHeaders(extra) {
+  const h = Object.assign({}, extra || {});
+  if (theKey()) h['X-API-Key'] = theKey();
+  return h;
+}
+function authQS(url) {
+  // 仅 SSE（EventSource 无法设置请求头）允许 key 进查询串
+  if (!theKey()) return url;
+  return url + (url.includes('?') ? '&' : '?') + 'api_key=' + encodeURIComponent(theKey());
+}
+
 async function api(path, opts) {
+  opts = opts || {};
+  opts.headers = authHeaders(opts.headers);
   const r = await fetch(path, opts);
+  if (r.status === 401) throw new Error('未授权：请在右上角填入 API Key');
+  if (r.status === 403) throw new Error('禁止访问：' + ((await r.json()).detail || '租户被禁用或权限不足'));
+  if (r.status === 429) {
+    const retry = r.headers.get('Retry-After');
+    throw new Error('触发限流：' + ((await r.json()).detail || '') + (retry ? `（${retry}s 后重试）` : ''));
+  }
   if (!r.ok) throw new Error((await r.json()).detail || r.status);
   return r.json();
 }
@@ -151,7 +185,7 @@ async function submitTask() {
   try {
     t = await api('/api/tasks', { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify(body) });
   } catch (e) {
-    return toast('提交失败：' + e.message + '（服务可能正在重启，请稍后重试）', true);
+    return toast('提交失败：' + e.message, true);
   }
   toast('任务已提交：' + t.id, false);
   document.getElementById('goal').value = '';
@@ -196,7 +230,7 @@ let es = null;
 function closeStream() { if (es) { es.close(); es = null; } }
 function openStream() {
   if (!currentId || es) return;
-  es = new EventSource(`/api/tasks/${currentId}/stream`);
+  es = new EventSource(authQS(`/api/tasks/${currentId}/stream`));
   es.addEventListener('task', ev => { try { renderTask(JSON.parse(ev.data)); } catch (_) {} });
   es.addEventListener('stream_end', () => { closeStream(); refreshDetail(); });
   // 其余事件按类型名注册：与后端 emit 的事件名一一对应
@@ -237,12 +271,15 @@ function renderTask(t) {
 
   const terminal = TERMINAL.includes(t.status);
   const chips = [];
+  if (t.status === 'waiting_approval') chips.push('<span class="plan-chip warn">⏸ 待人工审批（下一轮工具执行前）</span>');
   if (t.downgraded) chips.push('<span class="plan-chip warn">已降级</span>');
   if (t.selfheal_count) chips.push(`<span class="plan-chip">自愈 ${t.selfheal_count} 次</span>`);
   if (!terminal && t.checkpoint_next && t.checkpoint_next.length) {
     chips.push(`<span class="plan-chip">断点：${esc(t.checkpoint_next.join(', '))}</span>`);
   }
   document.getElementById('d-plan').innerHTML = chips.join('');
+  document.getElementById('btn-approve').style.display = t.status === 'waiting_approval' ? '' : 'none';
+  document.getElementById('btn-reject').style.display = t.status === 'waiting_approval' ? '' : 'none';
 
   const box = document.getElementById('result');
   if (t.result) { box.style.display = 'block'; document.getElementById('d-result').textContent = t.result; }
@@ -268,7 +305,8 @@ function appendEvent(e) {
 
 async function exportTrace(format) {
   if (!currentId) return;
-  const res = await fetch(`/api/tasks/${currentId}/export?format=${format}`);
+  const res = await fetch(`/api/tasks/${currentId}/export?format=${format}`, { headers: authHeaders() });
+  if (!res.ok) { toast('导出失败：' + res.status, true); return; }
   const text = await res.text();
   const blob = new Blob([text], { type: format === 'md' ? 'text/markdown' : 'application/json' });
   const a = document.createElement('a');
@@ -282,6 +320,20 @@ async function resumeTask() {
   if (!currentId) return;
   await api(`/api/tasks/${currentId}/resume`, { method: 'POST' });
   if (!pollTimer) { selectTask(currentId); }
+}
+
+async function approveTask() {
+  if (!currentId) return;
+  await api(`/api/tasks/${currentId}/approve`, { method: 'POST' });
+  toast('已批准，任务继续执行', false);
+  selectTask(currentId);
+}
+
+async function rejectTask() {
+  if (!currentId) return;
+  await api(`/api/tasks/${currentId}/reject`, { method: 'POST' });
+  toast('已拒绝，任务将取消', false);
+  selectTask(currentId);
 }
 
 async function cancelTask() {

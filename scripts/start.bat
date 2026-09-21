@@ -157,16 +157,21 @@ echo [3/6] 正在检查依赖...
 if !errorlevel! EQU 0 (
   echo        依赖已齐全，无需安装。
 ) else (
-  echo        依赖缺失，正在自动安装（pip install -r requirements.txt）...
+  echo        依赖缺失，正在自动安装...
   echo        这一步需要联网，首次安装可能需要几分钟，请耐心等待。
   echo.
-  "%PY%" -m pip install -r "%PROJECT_ROOT%\requirements.txt"
+  rem 优先用锁定文件：声明文件是 >=，装出来的版本随上游漂；
+  rem lock 是本地验证过的组合（详见 requirements.lock.txt 头部注释）。
+  set "REQ_FILE=%PROJECT_ROOT%\requirements.lock.txt"
+  if not exist "!REQ_FILE!" set "REQ_FILE=%PROJECT_ROOT%\requirements.txt"
+  echo        使用: !REQ_FILE!
+  "%PY%" -m pip install -r "!REQ_FILE!"
   if !errorlevel! NEQ 0 (
     echo.
     echo [错误] 依赖安装失败。
     echo        常见原因与处理：
     echo          1. 网络不通或被代理拦截 —— 可改用国内镜像源后重试：
-    echo             "%PY%" -m pip install -r requirements.txt -i https://pypi.tuna.tsinghua.edu.cn/simple
+    echo             "%PY%" -m pip install -r requirements.lock.txt -i https://pypi.tuna.tsinghua.edu.cn/simple
     echo          2. 没有写入权限 —— 请以普通用户身份运行，或改用虚拟环境；
     echo          3. Python 版本过低 —— 本项目需要 Python 3.11 及以上。
     echo.
