@@ -26,6 +26,11 @@ os.environ["LLM_MODEL"] = "test-model"
 os.environ["LLM_BASE_URL"] = "http://localhost:9/v1"
 # 工具层必须一起冻结，否则测试不封闭（见文件头说明）
 os.environ["SEARCH_PROVIDER"] = "mock"
+# 博查 key 冻结为空：auto 遍历会跳过未配置的源，测试就不会出网。不冻结的话，
+# 用户在 .env 里填了真实 key 后 get_settings() 会读到它，全量回归里
+# test_auto_reports_all_sources...（没桩 bocha）就会真的发请求 —— 实测过的同类坑：
+# "脚本冻结了模型层却没冻结工具层"。需要测博查的用例用 monkeypatch.setenv 单独注入。
+os.environ["BOCHA_API_KEY"] = ""
 # 退避重试：测试默认零延迟，真实等待由 tests/test_retry_backoff.py 单独覆盖
 os.environ["RETRY_BASE_DELAY_S"] = "0"
 os.environ["RETRY_MAX_DELAY_S"] = "0"

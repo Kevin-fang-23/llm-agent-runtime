@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 
 from fastapi import APIRouter, Depends, HTTPException, Request
 from fastapi.responses import StreamingResponse
@@ -28,7 +29,15 @@ from app.worker.local_queue import new_task_id
 
 router = APIRouter(prefix="/api", tags=["tasks"])
 
+log = logging.getLogger("agent.api")
+
 TERMINAL = (STATUS_DONE, STATUS_FAILED, STATUS_CANCELED, STATUS_BUDGET_EXCEEDED)
+
+# 允许**删除**的状态：刻意不含 running / resuming —— 执行器正在跑的任务被删掉后，
+# 它的写回（update_task）会找不到行，而已经烧掉的 token 也无从追溯；想删就先用
+# /cancel 把它停下来。queued 可以删：消费循环取到已删任务时 get_task 返回 None，
+# 走既有的"任务不存在"分支安全返回（见 local_queue._execute），不会留下脏状态。
+DELETABLE = ("queued", "waiting_approval") + TERMINAL
 # SSE 轮询间隔与最长连接时间（后者是防止客户端断连未被察觉导致协程悬挂的安全阀）
 STREAM_POLL_S = 0.4
 STREAM_MAX_S = 300.0
@@ -378,6 +387,35 @@ async def cancel_task(task_id: str, request: Request,
     return {"id": task_id, "status": "canceling" if ok else "canceled"}
 
 
+@router.delete("/tasks/{task_id}")
+async def delete_task(task_id: str, request: Request,
+                      tenant: TenantContext = Depends(require_tenant)):
+    """删除任务及其轨迹数据（**不可恢复**）。
+
+    与 /cancel 的分工：cancel 是"停下这个任务"（行保留、可追溯、可恢复），
+    delete 是"把它从列表里彻底移除"（任务行 + 事件 + span + 工具流水一并删）。
+    两者语义不同，页面各给一个入口，不互相代替。
+
+    为什么返回 200 + JSON 体而不是 204：前端统一用 api() 辅助函数发请求，它
+    无条件 `return r.json()`，204 空体会让它抛解析错误 —— 契约跟着既有调用方走。
+
+    并发/竞态：先读状态判定再删，两步之间若有另一个请求抢先删掉，delete_task
+    会返回 None，这里同样回 404（对外语义一致，不暴露竞态细节）。
+    """
+    repo, _ = _deps(request)
+    task = await repo.get_task(task_id, tenant_id=tenant.id)
+    if task is None:
+        raise HTTPException(404, "任务不存在")
+    if task["status"] not in DELETABLE:
+        raise HTTPException(409, f"任务正在执行（{task['status']}），请先取消再删除")
+    deleted = await repo.delete_task(task_id, tenant_id=tenant.id)
+    if deleted is None:
+        raise HTTPException(404, "任务不存在")
+    # 删除是破坏性操作，留一条审计日志：谁在什么时候删掉了什么状态的任务
+    log.info("任务已删除：id=%s tenant=%s 原状态=%s", task_id, tenant.id, deleted.get("status"))
+    return {"id": task_id, "status": "deleted"}
+
+
 @router.get("/tools")
 async def list_tools(request: Request,
                      tenant: TenantContext = Depends(require_tenant)):
@@ -391,3 +429,31 @@ async def get_metrics(request: Request,
     """租户范围指标。token 消耗是成本数据，租户只见自己的；全局视图走管理端点。"""
     repo, _ = _deps(request)
     return await repo.metrics(tenant_id=tenant.id)
+
+
+@router.get("/session")
+async def get_session(request: Request,
+                      tenant: TenantContext = Depends(require_tenant)):
+    """当前会话信息：页面靠它决定要不要向使用者索要 API Key。
+
+    存在的理由：页面原先无条件渲染一个 "API Key（X-API-Key）" 输入框，即使本机
+    免密已经生效，使用者仍会看到一个"需要授权"的界面而不敢往下走 —— 界面得如实
+    反映后端的鉴权策略，而不是把"要不要密钥"这个判断留给使用者去猜。
+
+    **不返回任何密钥内容**，只返回身份与"当前这次请求是靠什么进来的"。
+    本端点本身就走 require_tenant，所以能到达这里就说明鉴权已通过 ——
+    对页面来说「能拿到 200」本身就是"不需要用户做任何事"的证明。
+
+    模式取自 tenant.via（require_tenant 实际走的分支），**不能**用"租户名是不是
+    default"反推：公网用户带着 default 租户密钥访问时租户名同样是 default，
+    反推会把"仍需密钥"误报成"免密"，页面于是漏掉索要密钥的入口。
+    """
+    settings = get_settings()
+    return {
+        "tenant": tenant.name,
+        "auth_enabled": settings.auth_enabled,
+        "via": tenant.via,
+        "passwordless": tenant.via in ("disabled", "localhost"),
+        "mode": ("disabled" if tenant.via == "disabled"
+                 else "passwordless" if tenant.via == "localhost" else "api_key"),
+    }

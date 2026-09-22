@@ -253,8 +253,14 @@ echo "[5/6] 正在启动服务..."
 mkdir -p "${PROJECT_ROOT}/data"
 SERVER_LOG="${PROJECT_ROOT}/data/server.log"
 
-nohup "${PY}" -m uvicorn app.main:app \
-  --host 127.0.0.1 --port "${CHOSEN_PORT}" \
+# 【为什么用 serve_dualstack.py 而不是直接 uvicorn --host】
+# 浏览器访问 http://localhost:8000 时，localhost 既可能解析成 IPv4 的 127.0.0.1，
+# 也可能解析成 IPv6 的 ::1（取决于 /etc/hosts 与系统的地址偏好）。
+# 若服务只监听其中一个地址，另一族来的连接会被拒绝 —— 表现就是"页面打不开 /
+# 一直提示未授权"。而 uvicorn 的 --host 只能接受单个地址，所以用
+# serve_dualstack.py 同时绑定 127.0.0.1 与 ::1（两者都是回环地址，
+# 仍享有本机免密，不会暴露到局域网）。
+nohup "${PY}" "scripts/serve_dualstack.py" --port "${CHOSEN_PORT}" \
   >"${SERVER_LOG}" 2>&1 &
 SERVER_PID=$!
 
@@ -310,6 +316,28 @@ echo "  访问地址： http://127.0.0.1:${CHOSEN_PORT}"
 echo "  轨迹页面： http://127.0.0.1:${CHOSEN_PORT}/  （左提交任务，右看轨迹）"
 echo "  API 文档： http://127.0.0.1:${CHOSEN_PORT}/docs"
 echo "  服务日志： ${SERVER_LOG}"
+echo
+
+# ---------- 鉴权自检：确认「本机免密」真的生效 ----------
+# 把"页面提示未授权"这类问题拦在启动阶段，而不是让用户打开浏览器后才发现。
+# 判定依据是后端 /api/session 的返回值：mode=passwordless 表示免密生效。
+SESSION_JSON="$(curl -s --max-time 5 "http://127.0.0.1:${CHOSEN_PORT}/api/session" 2>/dev/null)"
+if printf '%s' "${SESSION_JSON}" | grep -q '"mode":"passwordless"'; then
+  echo "  鉴权状态：本机免密已生效 —— 页面打开即可直接提交任务，无需任何 API Key。"
+elif printf '%s' "${SESSION_JSON}" | grep -q '"mode":"disabled"'; then
+  echo "  [注意] 鉴权状态：AUTH_ENABLED=false，任何人可提交任务，仅限本机开发使用！"
+elif printf '%s' "${SESSION_JSON}" | grep -q '"mode":"api_key"'; then
+  echo "  [注意] 鉴权状态：本机免密**未生效**，页面会要求填写 API Key。"
+  echo "         可能原因与修法："
+  echo "           1. .env 里设了 AUTH_LOCALHOST_BYPASS=false —— 删掉该行或改为 true；"
+  echo "           2. 服务被反向代理接管，请求来源不再是本机回环地址；"
+  echo "           3. 确实需要密钥：从 data/api_credentials.json 取 default_tenant_key，"
+  echo "              点页面右上角徽标填入即可（密钥只存在你的浏览器本地）。"
+else
+  echo "  [注意] 鉴权状态：自检未取到结果（raw=${SESSION_JSON}）。"
+  echo "         多为服务仍在初始化或 /api/session 异常，请稍后刷新页面重试。"
+fi
+
 echo
 echo "  停止服务：在本终端按 Ctrl+C（脚本会自动停掉后台进程）"
 echo "============================================================"

@@ -91,6 +91,22 @@ LLM_BASE_URL=http://127.0.0.1:9100/v1 LLM_API_KEY=mock \
   LLM_MODEL=mock-model python -m uvicorn app.main:app --port 8000   # 终端 2
 ```
 
+### 界面展示
+
+以下均为**真实运行截图**（`docs/images/`）：左侧提交任务、管理历史；右侧实时渲染执行轨迹与交付结果。
+
+**主界面**——提交表单、任务列表（状态徽章 / token 消耗 / 步数 / 删除按钮）、顶部指标栏与「本机免密」角标：
+
+![主界面：任务列表与提交表单](docs/images/screenshot-home.png)
+
+**任务执行中**——详情面板经 SSE 实时接收状态：running 徽章、token / 步数双维度预算进度条，以及从断点恢复 / 取消 / **删除** / 导出 JSON·Markdown 入口：
+
+![任务执行中：实时详情面板](docs/images/screenshot-running.png)
+
+**交付完成**——交付结果与执行轨迹时间线（`llm_step` / `tool_result` 可折叠展开）。下图这轮任务还触发了 **token 预算降级**（「已降级」chip：超限后自动切换便宜模型续跑），并按「无权威来源时的多源一致参考判定」给出**带证据等级标注的参考性答案**——首句声明「未经权威信源证实」，同时写明依据来自哪些来源：
+
+![交付完成：参考性答案与执行轨迹](docs/images/screenshot-done.png)
+
 ### 关键演示脚本
 
 ```bash
@@ -115,31 +131,16 @@ python scripts/demo_cli.py --offline   # 全链路：ReAct → 并行工具 → 
 
 ## 四、架构
 
-```
-┌────────────┐   ┌──────────────────────────────────────┐
-│  Web / CLI  │──▶│  API 层 (FastAPI)                    │
-└────────────┘   │  任务提交 / 轨迹查询 / 断点恢复 / 指标  │
-                 └──────────┬───────────────────────────┘
-                            ▼
-                 ┌──────────────────────────────────────┐
-                 │  调度层：asyncio 队列(默认) / Celery+Redis │
-                 │  任务信号量(并发控制) / 协作式取消        │
-                 └──────────┬───────────────────────────┘
-                            ▼
-                 ┌──────────────────────────────────────┐
-                 │  执行引擎 (LangGraph StateGraph)       │
-                 │  planner → react_step ⇄ tool_executor │
-                 │      ↘ critic(重试/重规划/终止) ↗      │
-                 │  compressor(上下文压缩) → budget 双维预算│
-                 │  checkpoint 持久化 (SQLite/PostgreSQL) │
-                 └──────────┬───────────────────────────┘
-                            ▼
-                 ┌──────────────────────────────────────┐
-                 │  工具层 (MCP 风格注册表 + JSON Schema)   │
-                 │  web_search / code_run(Docker沙箱) /   │
-                 │  db_query(只读) / file_ops(路径越狱防护) │
-                 └──────────────────────────────────────┘
-```
+![系统架构：接入层 / API 层 / 调度层 / 执行引擎 / 工具层 / 存储与可观测](docs/images/architecture.png)
+
+> 图中每个模块名都对应 `app/` 下的真实文件，可直接检索到实现。要点：
+>
+> - **接入层**：Web 单页（零依赖）与 CLI、MCP 客户端共用同一套 REST + SSE API；
+> - **API 层**：鉴权 / 四层限流（L4 以 tasks 表实耗 + 在途预占为事实来源）/ 多租户隔离都在请求入口完成，业务代码零感知；
+> - **调度层**：`QUEUE_MODE` 在进程内 asyncio 队列与 Celery+Redis 之间切换，业务代码不变；
+> - **执行引擎**：LangGraph 状态机在 superstep 边界自动落 checkpoint，critic 按结构化错误码分流（retryable / plan_defect / fatal）；
+> - **工具层**：MCP 风格注册表 + JSON Schema 校验 + 自愈循环 + 声明式退避重试；搜索源按 bocha → sogou → bing → ddgs 兜底，共用相关性出口校验与来源可信度分级；
+> - **存储与可观测**：事件流 / span 树 / 工具执行流水（幂等去重）落库，Prometheus 指标与脱敏日志零依赖导出。
 
 状态机流转：`START → (planner | react_step) → tool_executor → critic → {compressor → react_step | planner | finisher} → END`。每个 superstep 结束自动落 checkpoint。
 
@@ -158,6 +159,7 @@ python scripts/demo_cli.py --offline   # 全链路：ReAct → 并行工具 → 
 | POST | `/api/tasks/{id}/cancel` | 协作式取消（节点边界优雅收尾） |
 | GET | `/api/tools` | MCP `tools/list` 风格工具清单 |
 | GET | `/api/metrics` | token/步数/自愈/耗时聚合（**租户范围**，只见自己的数据） |
+| GET | `/api/session` | 当前会话的鉴权形态（`passwordless` / `api_key` / `disabled`），**页面据此决定要不要索要密钥**；不返回任何密钥内容 |
 | POST | `/api/admin/tenants` | 创建租户（明文 API Key **仅此一次**返回） |
 | GET | `/api/admin/tenants` | 租户列表（不含任何密钥字段） |
 | PATCH | `/api/admin/tenants/{id}` | 禁用/启用、调整每日 token 配额 |
@@ -166,7 +168,22 @@ python scripts/demo_cli.py --offline   # 全链路：ReAct → 并行工具 → 
 | GET | `/api/admin/metrics` | 全局指标（跨租户聚合，管理端点专用） |
 | GET | `/metrics` | **Prometheus exposition**（进程级低基数聚合，**不在 `/api` 前缀下**、无需鉴权，供抓取器每 15s 拉取） |
 
-**鉴权约定**：除 `/health`、`/metrics` 与静态页外，`/api/*` 一律要求 `X-API-Key` 请求头（也接受 `Authorization: Bearer`；SSE 端点额外接受 `?api_key=`，因 EventSource 无法设置请求头）。管理端点用独立的 `X-Admin-Key`。**零配置引导**：首次启动自动生成管理员密钥与 `default` 租户密钥，写入 `data/api_credentials.json`（env `ADMIN_API_KEY` 优先）；Web 页右上角填入租户 Key 即可使用。
+**鉴权约定**：除 `/health`、`/metrics` 与静态页外，`/api/*` 一律要求 `X-API-Key` 请求头（也接受 `Authorization: Bearer`；SSE 端点额外接受 `?api_key=`，因 EventSource 无法设置请求头）。管理端点用独立的 `X-Admin-Key`。**零配置引导**：首次启动自动生成管理员密钥与 `default` 租户密钥，写入 `data/api_credentials.json`（env `ADMIN_API_KEY` 优先）。
+
+**本机免密（`AUTH_LOCALHOST_BYPASS=true`，默认）**：来自回环地址（`127.0.0.1` / `::1`）的请求**无需任何 API Key**，直接落到 `default` 租户 —— 双击 `scripts/start.bat` 后页面打开即可提交任务，右上角只显示一个"本机免密"角标，不再索要密钥。判定只看 **socket 对端地址**，默认**完全不信任 `X-Forwarded-For`**（该头客户端可随意伪造，信它等于把鉴权交给攻击者；确有自控反代时才设 `TRUSTED_PROXY_HOPS`）。
+
+这不是"关掉鉴权"：**从别的机器直连本服务（局域网 IP、或经 nginx/Caddy 这类反向代理转发）时，对端不是回环地址，仍要求 `X-API-Key`**。
+
+⚠️ **但反向隧道不在此列 —— 用 ngrok / cloudflared / frp 把本机端口暴露到公网时，本机免密会被"顺带"绕过。** 实测（`GET /api/session` 观察 `via` 字段）确认：隧道的工作方式是**你这台机器主动向外建连**，外部访客的流量从云端沿这条已有连接推回本地，因此服务看到的 socket 对端就是 `127.0.0.1` 本身 —— 每个外部访客都会被判定成"本机访问"，直接落到 `default` 租户。别拿"我开了 ngrok 所以别人会被挡"当防线。真要挂公网演示，二选一：
+
+- **给 `default` 租户设一个小额度**（推荐，保留免密便利）：`PATCH /api/admin/tenants/{id}` 传 `daily_token_quota`，地址泄露最多烧掉这点额度，且能随时归零；
+- **严格模式**：启动前设 `AUTH_LOCALHOST_BYPASS=false`，此时连本机也要真的填密钥。
+
+无论哪种模式，页面都通过 `GET /api/session` 得知当前该怎么进（`passwordless` / `api_key` / `disabled`），只有确实需要密钥时才浮现填写入口 —— 密钥存本浏览器，**不进 URL**（SSE 已从 `EventSource` 改为 `fetch` 读响应流，密钥一律走请求头）。
+
+**双栈监听**：`uvicorn --host` 一次只能绑**一个**地址，而浏览器把 `localhost` 解析成 `::1`（IPv6）还是 `127.0.0.1`（IPv4）并不确定 —— 只监听 IPv4 时，用 `localhost` 打开会连不上、页面报"未授权/连接失败"（**这正是"双击启动后页面仍然无法操作"的根因**）。故 `scripts/start.bat` / `start.sh` 改用 `scripts/serve_dualstack.py`，在**同一进程**内同时监听 `127.0.0.1:PORT` 与 `[::1]:PORT`（`IPV6_V6ONLY=1` 防止两者抢同一端口）。两个 socket 均**只绑回环**，从不绑 `0.0.0.0`/`::`，所以"本机免密"的前提依旧是"只有本机能连"。启动脚本末尾会打印一次 `/api/session` 的实际鉴权形态，**启动那一刻就知道网页会是什么状态**，不用进了浏览器才发现不对。
+
+**搜索精准性**：所有源共用一道相关性出口校验（`_ensure_relevant`）—— 解析不出、或结果与查询不沾边时**不把噪声当证据交给模型**。匹配按语言分粒度：英文按**词边界**（`agent` 命中 `agents`，但不从词内部碰巧命中）、中文按**bigram 覆盖率**（"北京天气"能匹配"北京今日天气"，整段比对会漏召回）。高频泛化词（report/change/settings/首页/下载…）**不计分也不计入分母** —— 否则 `climate change report` 会命中「Change your report settings」而被放行。`mock` 源命中不了语料时返回**空结果 + 明确标注"没有证据、不得编造"**，不再回一条像是"查到了内容"的通用条目。
 
 **trace 约定**：提交任务时可带标准 W3C `traceparent: 00-<trace-id>-<span-id>-<flags>` 头，运行时原样复用该 `trace_id`（接得上上游链路），并把入站的 `parent-id` 继承为本进程 root span 的父节点 —— 于是**跨进程也能拼成一棵树**；不带或格式非法则自动生成 32 位 hex。`trace_id` 落进每条事件（`events.trace_id`）与每条日志，审批恢复（`/approve`、`/reject`）视为**一次新的触发**，另起一条 trace。
 
@@ -196,7 +213,7 @@ docker compose up --build                        # PG + Redis + API + Celery wor
 
 ```bash
 python -m pytest tests/ -q
-# 389 个用例：379 条本地直接可跑（含 celery eager 离线路径）；10 条需 Docker daemon /
+# 390 个用例：380 条本地直接可跑（含 celery eager 离线路径）；10 条需 Docker daemon /
 # PostgreSQL / Redis（不可用时自动 skip，CI 上会真跑）。
 # CI 口径：test job 收集 375（celery_path 整体归入 integration job），integration 14 条。
 ```
@@ -227,8 +244,8 @@ web/index.html         轨迹可视化（零依赖单页）
 sandbox/Dockerfile     代码执行沙箱镜像（python:3.11-slim 最小化）
 scripts/               CLI 演示 / 崩溃恢复演示 / 指标脚本 / Mock LLM / 种子库
 migrations/            Alembic 迁移（baseline 由 autogenerate 生成 + async env）
-tests/                 389 个测试（379 离线 + 10 需 Docker/PG/Redis）
-docs/                  目标差距评估与 P0/P1 修复记录
+tests/                 390 个测试（380 离线 + 10 需 Docker/PG/Redis）
+docs/                  目标差距评估与 P0/P1 修复记录 + 架构图与界面截图（images/）
 .github/workflows/     CI 四道门禁
 requirements.txt       直接依赖的兼容范围（`>=`）
 requirements.lock.txt  全量锁定版本，可复现安装（CI 使用）

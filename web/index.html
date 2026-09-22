@@ -32,6 +32,11 @@
   .task-item:hover { background: var(--panel2); }
   .task-item.active { background: var(--panel2); border-left: 3px solid var(--accent); }
   .task-item .goal { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .task-item .row { display: flex; align-items: center; gap: 6px; }
+  .task-item .row .goal { flex: 1; min-width: 0; }
+  .task-item .del { flex: none; background: transparent; border: none; color: var(--muted);
+    cursor: pointer; font-size: 13px; line-height: 1; padding: 2px 5px; border-radius: 4px; }
+  .task-item .del:hover { color: #e5604c; background: rgba(229,96,76,.14); }
   .task-item .meta { color: var(--muted); font-size: 11px; margin-top: 3px; display: flex; gap: 8px; align-items: center; }
   .status { display: inline-block; padding: 1px 8px; border-radius: 10px; font-size: 11px; font-weight: 600; }
   .status.running { background: #1d3a5f; color: #79aaff; }
@@ -67,6 +72,12 @@
   .ev.t-step_done { border-left-color: #3fb96f; } .ev.t-step_done .type { color: #3fb96f; }
   .ev.t-task_done { border-left-color: var(--green); } .ev.t-task_done .type { color: var(--green); }
   .empty { color: var(--muted); text-align: center; padding: 60px 0; }
+  /* 鉴权状态角标：免密时低调提示，需要密钥时给出可展开的填写入口 */
+  .auth-badge { font-size: 11px; color: var(--muted); border: 1px solid var(--border);
+                border-radius: 10px; padding: 3px 10px; white-space: nowrap; }
+  .auth-badge.ok { border-color: var(--green); color: var(--green); }
+  .auth-badge.warn { border-color: var(--yellow); color: var(--yellow); cursor: pointer; }
+  .auth-badge.warn:hover { filter: brightness(1.15); }
   .plan-chip { display: inline-block; background: var(--panel2); border: 1px solid var(--border); border-radius: 6px; padding: 4px 10px; margin: 3px 4px 0 0; font-size: 12px; }
   .plan-chip.done { border-color: var(--green); color: var(--green); }
   .plan-chip.pending { color: var(--muted); }
@@ -88,8 +99,7 @@
   <h1>LLM Agent Runtime</h1>
   <span class="sub">自然语言目标 → 自主规划 → 工具执行 → 交付</span>
   <div id="metrics"></div>
-  <input id="apikey" type="password" placeholder="API Key（X-API-Key）" autocomplete="off"
-         style="width:200px;background:var(--panel2);border:1px solid var(--border);color:var(--text);border-radius:6px;padding:5px 8px;font-size:12px">
+  <span id="auth-badge" class="auth-badge" title="鉴权状态"></span>
 </header>
 <div class="layout">
   <aside class="sidebar">
@@ -119,6 +129,8 @@
           <button class="ghost" onclick="rejectTask()" id="btn-reject" style="display:none;border-color:#e5604c;color:#e5604c">✗ 拒绝</button>
           <button class="ghost" onclick="resumeTask()">从断点恢复</button>
           <button class="ghost" onclick="cancelTask()">取消任务</button>
+          <button class="ghost" onclick="deleteTask(currentId)"
+                  style="border-color:#e5604c;color:#e5604c">删除任务</button>
           <button class="ghost" onclick="exportTrace('json')">导出 JSON</button>
           <button class="ghost" onclick="exportTrace('md')">导出 Markdown</button>
         </div>
@@ -132,36 +144,145 @@
 let currentId = null, lastSeq = -1, pollTimer = null;
 const evPayload = e => JSON.stringify(e.payload);
 
-// ---- API Key：header 输入框，存 localStorage，所有请求自动携带 ----
-const keyInput = document.getElementById('apikey');
-keyInput.value = localStorage.getItem('agent_api_key') || '';
-keyInput.addEventListener('change', () => {
-  localStorage.setItem('agent_api_key', keyInput.value.trim());
-  refreshList().catch(() => {});
-});
-const theKey = () => keyInput.value.trim();
+// ---- 鉴权：默认无感 ----
+// 页面不再无条件索要 API Key。后端对来自本机（回环地址）的请求默认免密放行，
+// 所以双击启动脚本后页面开箱即用。
+// 注意：把服务经 **反向隧道**（ngrok/cloudflared/frp）暴露到公网时，本机免密会被
+// 一并绕过 —— 隧道由本机主动外连，服务看到的对端仍是回环地址，外部访客会被当成
+// "本机访问"。要挂公网演示，请给 default 租户设一个小额度，或设
+// AUTH_LOCALHOST_BYPASS=false 走严格模式（那时才需要密钥，并且：
+//   * 密钥只存在本浏览器的 localStorage，不进 URL（旧实现把 key 拼进 SSE 查询串，
+//     会被访问日志与代理记录 —— 现已改成读取响应流，key 一律走请求头）；
+//   * 页面从不回显、也从不向任何第三方发送它。
+const KEY_STORE = 'agent_api_key';
+const theKey = () => (localStorage.getItem(KEY_STORE) || '').trim();
+// 服务端是否对本机免密 —— 由 initAuth 用**不带密钥**的探测请求得出。
+// 免密生效时绝不发送本地密钥：本地可能残留上一轮填的旧 key，凭据轮换后它已失效，
+// 带上它会让后端优先走密钥校验并回 401 ——"页面什么都点不动"就是这么来的。
+let SERVER_PASSWORDLESS = false;
 function authHeaders(extra) {
   const h = Object.assign({}, extra || {});
-  if (theKey()) h['X-API-Key'] = theKey();
+  if (!SERVER_PASSWORDLESS && theKey()) h['X-API-Key'] = theKey();
   return h;
 }
-function authQS(url) {
-  // 仅 SSE（EventSource 无法设置请求头）允许 key 进查询串
-  if (!theKey()) return url;
-  return url + (url.includes('?') ? '&' : '?') + 'api_key=' + encodeURIComponent(theKey());
+
+const authBadge = document.getElementById('auth-badge');
+function setAuthBadge(mode) {
+  if (mode === 'api_key') {
+    authBadge.className = 'auth-badge warn';
+    authBadge.textContent = theKey() ? '🔑 已配置密钥' : '🔑 需 API Key（点击配置）';
+    authBadge.onclick = () => promptApiKey();
+    authBadge.title = '当前来源需要 API Key，点击配置';
+  } else {
+    authBadge.className = 'auth-badge ok';
+    authBadge.textContent = mode === 'disabled' ? '免鉴权（开发模式）' : '本机免密';
+    // 免密生效时若本浏览器还留着旧密钥，给一个明确的清除入口 ——
+    // 否则用户看到"本机免密"却不知道为什么以前填的密钥还在、也找不到地方删。
+    const stale = theKey();
+    authBadge.onclick = stale ? () => {
+      localStorage.removeItem(KEY_STORE);
+      toast('已清除本浏览器残留的旧密钥');
+      initAuth();
+    } : null;
+    authBadge.title = stale ? '点击清除本浏览器残留的旧密钥' : '';
+  }
+}
+function ensurePolling() {
+  // 握手成功才拉起轮询：初始化分支在握手失败时是不启动轮询的，
+  // 这里若不补上，用户修好鉴权后页面依然是一片空白。
+  if (pollTimer) return;
+  const el = document.getElementById('detail');
+  el.className = 'empty';
+  el.innerHTML = '';
+  pollList();
+  pollTimer = setInterval(pollList, 4000);
+}
+function promptApiKey() {
+  const v = window.prompt('当前访问来源需要 API Key（本机 127.0.0.1 访问无需填写）。\n' +
+                          '密钥仅保存在本浏览器，不会写入 URL。', theKey());
+  if (v === null) return;
+  const t = v.trim();
+  if (t) localStorage.setItem(KEY_STORE, t); else localStorage.removeItem(KEY_STORE);
+  initAuth().then(ok => { if (ok) ensurePolling(); });
+}
+
+async function initAuth() {
+  // 第一步：**不带任何密钥**探测服务端能力。
+  // 本机免密是服务端针对"回环 + 无密钥"请求给出的，若这一步带上本地残留的旧
+  // 密钥，服务端会优先走密钥校验并回 401 —— 免密能力被一个失效的旧密钥完全
+  // 遮住，页面表现为"什么都点不动"。这是排查了三轮才定位到的坑。
+  let probe;
+  try {
+    probe = await fetch('/api/session');            // 刻意不带 authHeaders()
+  } catch (e) {
+    authBadge.className = 'auth-badge warn';
+    authBadge.textContent = '连接失败';
+    return false;
+  }
+  if (probe.ok) {
+    const s = await probe.json().catch(() => ({}));
+    if (s.mode === 'passwordless' || s.mode === 'disabled') {
+      SERVER_PASSWORDLESS = true;
+      if (theKey()) {
+        localStorage.removeItem(KEY_STORE);        // 它已无用且有害，直接清掉
+        throttleToast('已自动忽略本浏览器残留的旧密钥（本机免密生效，无需密钥）', false);
+      }
+      setAuthBadge(s.mode);
+      return true;
+    }
+    // mode === 'api_key'：服务端要求密钥（非本机来源，或关闭了免密）→ 走第二步
+  }
+  // 第二步：需要密钥的路径 —— 用本地密钥再试一次（没有密钥就提示配置）
+  SERVER_PASSWORDLESS = false;
+  if (!theKey()) { setAuthBadge('api_key'); return false; }
+  try {
+    const r = await fetch('/api/session', { headers: authHeaders() });
+    if (r.ok) { setAuthBadge((await r.json()).mode); return true; }
+  } catch (e) { /* 落到下面统一处理 */ }
+  setAuthBadge('api_key');
+  return false;
+}
+
+// 把 HTTP 响应翻译成人能看懂的报错。**所有**请求都要经这里，不要在调用点
+// 手写状态码分支 —— 之前就是因为 SSE 与导出这两处手写 fetch 没有 429 分支，
+// 限流被当成鉴权失败报了出去，排查方向整个被带偏。
+// 429 必须和 401 严格区分：前者是"发太快，等一下就好"，后者才是"没身份"。
+async function httpError(r) {
+  if (r.status === 401) {
+    // 自愈：本地存着密钥却仍被判未授权 —— 说明它已失效（凭据轮换 / 重建）。
+    // 自动清掉并重新握手，否则用户会一直卡在"未授权"，且根本不知道原因。
+    if (theKey()) {
+      localStorage.removeItem(KEY_STORE);
+      throttleToast('本地保存的密钥已失效，已自动清除并重新握手', false);
+      initAuth().then(ok => { if (ok) ensurePolling(); });
+    }
+    const d = await r.json().catch(() => ({}));
+    return new Error('未授权：' + (d.detail || '请看右上角鉴权状态（本机访问无需密钥）'));
+  }
+  if (r.status === 403) {
+    const d = await r.json().catch(() => ({}));
+    return new Error('禁止访问：' + (d.detail || '租户被禁用或权限不足'));
+  }
+  if (r.status === 429) {
+    // 429 有多种来源：L1 每 IP 限流 / L4 每日 token 配额（含在途预占）等。
+    // 不要在这里断言具体是哪一层 —— 服务端 detail 里写得很清楚，照实转述，
+    // 断言错了会把排查方向整个带偏（"每 IP 每分钟限额"硬编码就误导演过一轮）。
+    const retry = parseInt(r.headers.get('Retry-After') || '0', 10);
+    const d = await r.json().catch(() => ({}));
+    const when = retry >= 3600 ? `约 ${(retry / 3600).toFixed(1)} 小时后重置`
+               : retry > 0 ? `${retry} 秒后重试`
+               : '请稍后重试';
+    return new Error('请求被限流：' + (d.detail || '') + `（${when}）`);
+  }
+  const d = await r.json().catch(() => ({}));
+  return new Error(d.detail || ('HTTP ' + r.status));
 }
 
 async function api(path, opts) {
   opts = opts || {};
   opts.headers = authHeaders(opts.headers);
   const r = await fetch(path, opts);
-  if (r.status === 401) throw new Error('未授权：请在右上角填入 API Key');
-  if (r.status === 403) throw new Error('禁止访问：' + ((await r.json()).detail || '租户被禁用或权限不足'));
-  if (r.status === 429) {
-    const retry = r.headers.get('Retry-After');
-    throw new Error('触发限流：' + ((await r.json()).detail || '') + (retry ? `（${retry}s 后重试）` : ''));
-  }
-  if (!r.ok) throw new Error((await r.json()).detail || r.status);
+  if (!r.ok) throw await httpError(r);
   return r.json();
 }
 
@@ -173,6 +294,16 @@ function toast(msg, isError) {
     `border:1px solid ${isError ? '#e5604c' : '#3fb96f'};box-shadow:0 4px 16px rgba(0,0,0,.4)`;
   document.body.appendChild(el);
   setTimeout(() => el.remove(), 4000);
+}
+
+// 轮询类请求每 4 秒跑一次，失败时若每次都弹提示会糊满屏幕（反而盖住真正的问题）。
+// 同一句话 15 秒内只提示一次 —— 让"有异常"这件事可见，但不制造噪音。
+const _toastSeen = new Map();
+function throttleToast(msg, isError = true, gapMs = 15000) {
+  const now = Date.now();
+  if (now - (_toastSeen.get(msg) || 0) < gapMs) return;
+  _toastSeen.set(msg, now);
+  toast(msg, isError);
 }
 
 async function submitTask() {
@@ -189,16 +320,34 @@ async function submitTask() {
   }
   toast('任务已提交：' + t.id, false);
   document.getElementById('goal').value = '';
-  await refreshList().catch(() => {});
+  // 立即刷新列表，而不是等下一次 4 秒轮询 —— 使用者刚提交完就该在左栏看到它。
+  // 失败不阻断：列表轮询会兜底拉回（这里只是把"看到"提前，不改变数据来源）。
+  try { await refreshList(); } catch (_) { /* 轮询兜底 */ }
   selectTask(t.id);
+}
+
+// 4 秒轮询：列表 + 指标。两件事一起拉，失败的提示走节流版 toast ——
+// 旧实现把所有异常都 .catch(() => {}) 吞掉，导致"页面数据不动"完全无迹可寻，
+// 排查时只能靠猜（这次 401/429 混淆就是这么被掩盖的）。
+async function pollList() {
+  try {
+    await refreshList();
+  } catch (e) {
+    throttleToast('列表刷新失败：' + e.message);
+  }
 }
 
 async function refreshList() {
   const tasks = await api('/api/tasks');
   const el = document.getElementById('task-list');
   el.innerHTML = tasks.map(t => `
-    <div class="task-item ${t.id === currentId ? 'active' : ''}" onclick="selectTask('${t.id}')">
-      <div class="goal">${esc(t.goal)}</div>
+    <div class="task-item ${t.id === currentId ? 'active' : ''}" data-id="${t.id}"
+         onclick="selectTask('${t.id}')">
+      <div class="row">
+        <div class="goal">${esc(t.goal)}</div>
+        <button class="del" title="删除该任务（任务与轨迹一并删除，不可恢复）"
+                onclick="event.stopPropagation(); deleteTask('${t.id}')">✕</button>
+      </div>
       <div class="meta"><span class="status ${t.status}">${t.status}</span>
         <span>${t.mode}</span><span>${t.tokens_used} tok</span><span>${t.steps_used} 步</span></div>
     </div>`).join('');
@@ -215,8 +364,12 @@ async function selectTask(id) {
   document.getElementById('events').innerHTML = '';
   document.getElementById('detail').style.display = 'none';
   document.getElementById('detail-body').style.display = 'block';
-  document.querySelectorAll('.task-item').forEach(n => n.classList.remove('active'));
-  clearInterval(pollTimer); pollTimer = null;
+  // 选中态就地更新（不重发列表请求）：按 data-id 精确切换，避免"点了半天没反应"
+  document.querySelectorAll('.task-item').forEach(n => n.classList.toggle('active', n.dataset.id === id));
+  // 这里**不能**停列表轮询：pollTimer 表示的是左栏列表的 4 秒轮询，与"详情 + SSE"
+  // 是两条独立的数据流。旧实现在这里 clearInterval(pollTimer)，于是每选中一个任务
+  // （提交任务也会走这里）左栏就再也不自动刷新了 —— 表现就是"提交完得手动刷页
+  // 才能看到新任务"，而 renderTask 里的注释却写着"列表轮询要继续"，实现与注释相反。
   closeStream();
   try {
     await refreshDetail();
@@ -226,32 +379,86 @@ async function selectTask(id) {
   }
 }
 
-let es = null;
-function closeStream() { if (es) { es.close(); es = null; } }
+let es = null;                 // 当前的 SSE 读取控制句柄（{abort, closed}）
+function closeStream() { if (es) { es.abort.abort(); es = null; } }
+
+// ---- SSE：用 fetch + 响应流读取，而不是 EventSource ----
+// 为什么不用 EventSource：它无法设置请求头，密钥只能塞进查询串，而 URL 会进
+// 访问日志、浏览器历史与反向代理日志 —— 等于把凭据写到了多个地方。
+// fetch 能带 X-API-Key 头，且 Response.body 是标准 ReadableStream，逐块解析
+// `event:` / `data:` 行即可，语义与后端推送的事件名完全一致。
 function openStream() {
   if (!currentId || es) return;
-  es = new EventSource(authQS(`/api/tasks/${currentId}/stream`));
-  es.addEventListener('task', ev => { try { renderTask(JSON.parse(ev.data)); } catch (_) {} });
-  es.addEventListener('stream_end', () => { closeStream(); refreshDetail(); });
+  const ctl = new AbortController();
+  es = { abort: ctl };
+  const url = `/api/tasks/${currentId}/stream`;
+  const handlers = eventHandlers();
+  // 按 SSE 规范解析：事件由空行分隔，每个事件含若干 `field: value` 行
+  let buf = '';
+  const dispatch = (chunk) => {
+    let name = 'message', data = [];
+    for (const line of chunk.split('\n')) {
+      if (line.startsWith(':')) continue;              // 注释/心跳
+      if (line.startsWith('event:')) name = line.slice(6).trim();
+      else if (line.startsWith('data:')) data.push(line.slice(5).replace(/^ /, ''));
+    }
+    if (!data.length) return;
+    const fn = handlers[name];
+    if (fn) { try { fn(data.join('\n')); } catch (_) {} }
+  };
+  fetch(url, { headers: authHeaders(), signal: ctl.signal })
+    .then(r => {
+      if (!r.ok || !r.body) throw new Error('HTTP ' + r.status);
+      const reader = r.body.getReader();
+      const dec = new TextDecoder();
+      const pump = () => reader.read().then(({ done, value }) => {
+        if (done) { if (es) { es = null; refreshDetail().catch(() => {}); } return; }
+        buf += dec.decode(value, { stream: true });
+        const parts = buf.split('\n\n');       // 空行分隔完整事件
+        buf = parts.pop();                     // 末段可能被截断，留到下一块
+        parts.forEach(dispatch);
+        return pump();
+      });
+      return pump();
+    })
+    // 断流/中止：静默，列表轮询仍在兜底。
+    // 但 429 要单独说一声 —— 它是"发太快"而不是"连接坏了"，
+    // 而且流被限流拒掉后若完全无声，页面就变成"数据莫名不动"。
+    .catch((err) => {
+      es = null;
+      if (ctl.signal.aborted) return;          // 主动关闭，不算异常
+      if (err && /429/.test(err.message || '')) {
+        throttleToast('轨迹流被限流，稍后自动重连（可减少刷新频率）');
+      }
+      // 其余情况（网络抖动、服务重启）保持静默：轮询会兜底拉回状态
+    });
+}
+
+function eventHandlers() {
+  const h = {
+    task: d => { try { renderTask(JSON.parse(d)); } catch (_) {} },
+    stream_end: () => { closeStream(); refreshDetail(); },
+  };
   // 其余事件按类型名注册：与后端 emit 的事件名一一对应
   for (const t of ['llm_step','tool_result','tool_error','tool_replay','tool_retry_scheduled',
                    'tool_retry_success','tool_retry_exhausted','tool_validation_failed',
                    'selfheal_success','plan_created','step_done','replan','critic','compress',
                    'budget_downgrade','budget_exceeded','task_done','task_failed','task_canceled',
                    'subagent_event']) {
-    es.addEventListener(t, ev => {
-      try { const e = JSON.parse(ev.data); appendEvent(e); } catch (_) {}
-    });
+    h[t] = d => { try { appendEvent(JSON.parse(d)); } catch (_) {} };
   }
-  es.onerror = () => { closeStream(); };
+  return h;
 }
 
 const TERMINAL = ['done', 'failed', 'canceled', 'budget_exceeded'];
 
+// 只取"任务详情"这一件事。**刻意不再顺带调用 refreshList()**：
+// 列表与指标由 4 秒轮询独立维护，详情刷新再带一遍纯属重复请求。
+// 之前的实现里 refreshDetail = 详情 + 列表 + 指标 = 3 次请求，而它会被
+// 流结束、断流、选中任务多处调用，一屏操作就能把每 IP 每分钟的额度吃满。
 async function refreshDetail() {
   if (!currentId) return;
   const t = await api(`/api/tasks/${currentId}`);
-  await refreshList();
   renderTask(t);
 }
 
@@ -286,7 +493,9 @@ function renderTask(t) {
   else if (t.error) { box.style.display = 'block'; document.getElementById('d-result').textContent = '错误：' + t.error; }
   else { box.style.display = 'none'; }
 
-  if (terminal) { clearInterval(pollTimer); pollTimer = null; }
+  // 任务进入终态不再需要 SSE 推送，但**列表轮询要继续** ——
+  // 否则跑完一个任务后，新建的任务不会出现在左栏（旧实现会连轮询一起停）。
+  if (terminal) { closeStream(); }
 }
 
 function appendEvent(e) {
@@ -306,7 +515,7 @@ function appendEvent(e) {
 async function exportTrace(format) {
   if (!currentId) return;
   const res = await fetch(`/api/tasks/${currentId}/export?format=${format}`, { headers: authHeaders() });
-  if (!res.ok) { toast('导出失败：' + res.status, true); return; }
+  if (!res.ok) { toast('导出失败：' + (await httpError(res)).message, true); return; }
   const text = await res.text();
   const blob = new Blob([text], { type: format === 'md' ? 'text/markdown' : 'application/json' });
   const a = document.createElement('a');
@@ -319,7 +528,9 @@ async function exportTrace(format) {
 async function resumeTask() {
   if (!currentId) return;
   await api(`/api/tasks/${currentId}/resume`, { method: 'POST' });
-  if (!pollTimer) { selectTask(currentId); }
+  // 用 pollTimer 判断"是否已在跟踪"是旧写法 —— pollTimer 现在专门表示
+  // 列表轮询，与"详情是否在跟踪"无关。恢复执行后统一重开详情 + 流。
+  selectTask(currentId);
 }
 
 async function approveTask() {
@@ -342,9 +553,60 @@ async function cancelTask() {
   refreshDetail();
 }
 
+// 删除任务（不可恢复）—— 与"取消任务"是两件事：取消只让它停下来、行与轨迹都留着，
+// 删除是把任务连同轨迹一起从列表里移除。破坏性操作，前端只负责二次确认与同步刷新，
+// 权限与状态约束（运行中不允许删）由后端判定，前端不重复实现规则。
+async function deleteTask(id) {
+  if (!id) return;
+  if (!window.confirm(
+      `确认删除任务 ${id}？\n\n任务与其执行轨迹（事件 / span / 工具流水）将一并删除，无法恢复。\n` +
+      `如果只是想让它停下来，请改用「取消任务」。`)) return;
+  try {
+    await api(`/api/tasks/${id}`, { method: 'DELETE' });
+  } catch (e) {
+    return toast('删除失败：' + e.message, true);
+  }
+  toast('任务已删除：' + id, false);
+  if (currentId === id) resetDetail();        // 正在看的任务被删：回到空态并断开 SSE
+  try { await refreshList(); } catch (_) { /* 轮询兜底 */ }
+}
+
+// 把右侧详情面板还原成"未选中任何任务"的样子（与首屏静态结构一致）。
+// 删除当前任务后必须走这一步：否则面板还挂着已删数据的残影，SSE 也还连着一个
+// 已经不存在的任务（每 0.4 秒拉一次注定 404 的查询）。
+function resetDetail() {
+  currentId = null;
+  closeStream();
+  const body = document.getElementById('detail-body');
+  if (body) body.style.display = 'none';
+  const d = document.getElementById('detail');
+  d.className = 'empty';
+  d.style.display = '';
+  d.innerHTML = '← 提交一个任务，或在左侧选择历史任务查看执行轨迹';
+  document.getElementById('events').innerHTML = '';
+}
+
 function esc(s) { const d = document.createElement('div'); d.textContent = s == null ? '' : String(s); return d.innerHTML; }
-refreshList().catch(() => {});
-setInterval(refreshList, 4000);
+
+// 启动：先确认鉴权状态，再拉数据。顺序有意义 —— 未授权时直接提示"需配置密钥"，
+// 而不是让一堆 401 弹成满屏 toast 后才让人去猜原因。
+(async () => {
+  const ok = await initAuth();
+  if (!ok) {
+    const el = document.getElementById('detail');
+    el.className = 'empty';
+    el.innerHTML = '当前访问来源需要 API Key（本机 127.0.0.1 访问无需配置）。' +
+                   '<br>点击右上角「需 API Key」填入，或改用 127.0.0.1 地址访问。';
+    // 握手失败就不再启动轮询：鉴权没过，轮询只会每 4 秒打一串注定失败的
+    // 请求（既刷不出数据，又在服务端留下一串 401 日志，误导排查方向）。
+    // 用户填入密钥后 promptApiKey() 会重新走 initAuth()，那时再拉起轮询。
+    return;
+  }
+  // 统一走 ensurePolling()：旧写法在这里直接 setInterval 却没有记到 pollTimer，
+  // 于是 clearInterval(pollTimer) 停不掉它、ensurePolling() 的幂等判断也失效
+  // （会再叠一个 4 秒轮询 → 请求量翻倍）。
+  ensurePolling();
+})();
 </script>
 </body>
 </html>

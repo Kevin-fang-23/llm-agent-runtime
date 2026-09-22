@@ -16,10 +16,16 @@
 - **零配置引导**：AUTH_ENABLED 默认开启；ADMIN_API_KEY 留空时首次启动生成，
   与 default 租户的 key 一起写入 credentials_file（env 优先于文件）。
   文件是生成密钥的唯一持久位置 —— 密钥只在创建时可见，重启后从文件恢复。
+- **本机免密放行**（AUTH_LOCALHOST_BYPASS，默认开启）：来自回环地址的请求免密钥，
+  直接落到 default 租户。一键启动脚本打开的就是 127.0.0.1，于是"双击即可用"。
+  公网/局域网来源地址不是回环地址，**仍然要求密钥** —— 这个开关不会在把演示地址
+  发给别人的那一刻把 LLM 账单敞开。判定只看 socket 对端地址，不看任何可伪造的
+  转发头（详见 _client_is_loopback 的说明）。
 """
 from __future__ import annotations
 
 import hashlib
+import ipaddress
 import json
 import logging
 import secrets
@@ -27,6 +33,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from fastapi import HTTPException, Request
+from starlette.requests import HTTPConnection
 
 from app.config import Settings, get_settings
 from app.storage.repository import Repository
@@ -52,15 +59,59 @@ def new_tenant_id() -> str:
 
 @dataclass(frozen=True)
 class TenantContext:
-    """一次请求解析出的租户身份。auth_enabled=False 时为共享匿名租户。"""
+    """一次请求解析出的租户身份。auth_enabled=False 时为共享匿名租户。
+
+    `via` 记录这一次请求**实际靠什么进来的**（"disabled" / "api_key" / "localhost"），
+    供 /api/session 如实回报。不能靠"租户名是不是 default"反推 —— 公网用户带着
+    default 租户的密钥访问时租户名同样是 default，反推会把"需要密钥"误报成"免密"。
+    """
 
     id: str
     name: str
     daily_token_quota: int = 0
+    via: str = "api_key"
 
     @classmethod
     def anonymous(cls) -> "TenantContext":
-        return cls(id="local", name="local")
+        return cls(id="local", name="local", via="disabled")
+
+
+def _client_is_loopback(conn: HTTPConnection, trusted_hops: int = 0) -> bool:
+    """请求是否来自本机回环地址。
+
+    判定依据是 **socket 对端地址**（`conn.client.host`），即 TCP 连接真实的对端。
+    这比读 HTTP 头可靠得多：
+
+    - `X-Forwarded-For` / `X-Real-IP` 由客户端完全控制，**任何外部请求都能伪造**
+      `X-Forwarded-For: 127.0.0.1` 冒充本机。把鉴权结论建立在这个头上，等于把
+      鉴权交给攻击者，所以默认**一律不读**它（trusted_proxy_hops=0）。
+    - 只有在部署者自己控制的反向代理后面，且该代理会覆写（而非追加）该头时，
+      才把 trusted_proxy_hops 设为跳数，此时取右起第 N 跳 —— 右侧是可信代理写入的，
+      左侧才是客户端可控的伪造段。
+
+    IPv4/IPv6 都覆盖：127.0.0.0/8、::1；另外 0.0.0.0 不可能是合法的对端地址，
+    但历史上某些 ASGI 服务器在 Unix socket 场景会填它，一并按本机处理，
+    以免"服务明明只听本机，却因为取不到地址而永远 401"。
+    """
+    host = conn.client.host if conn.client else None
+    if not host:
+        return False
+
+    if trusted_hops > 0:
+        fwd = [p.strip() for p in conn.headers.get("X-Forwarded-For", "").split(",") if p.strip()]
+        # 右起第 trusted_hops 跳：右侧是代理写入的可信段，左侧是客户端可伪造段
+        if len(fwd) >= trusted_hops:
+            host = fwd[-trusted_hops]
+
+    host = host.strip().strip("[]")          # IPv6 可能是 [::1] 形式
+    if host in ("localhost", "0.0.0.0"):
+        return True
+    # 去掉 IPv4-mapped IPv6 前缀（::ffff:127.0.0.1）
+    host = host.removeprefix("::ffff:")
+    try:
+        return ipaddress.ip_address(host).is_loopback
+    except ValueError:
+        return False
 
 
 class TenantRegistry:
@@ -109,22 +160,90 @@ def _extract_key(request: Request) -> str:
 
 
 async def require_tenant(request: Request) -> TenantContext:
-    """FastAPI 依赖：业务端点一律经此解析租户身份。"""
+    """FastAPI 依赖：业务端点一律经此解析租户身份。
+
+    放行顺序：显式关闭鉴权（逃生舱）→ 带 key（正常鉴权路径，优先于免密放行，
+    这样本机带着某个租户 key 调试时身份不会被改写成 default）→ 回环地址免密
+    （= default 租户）→ 401。
+
+    **无效 key 的容错（2026-09-21）**：key 存在但因轮换/重建凭据而失效时，若
+    请求来自回环地址且本机免密可用，则回落为 default 租户并记 warning，而不是
+    直接 401。真实踩坑：浏览器 localStorage 里残留着上一轮填的旧密钥，前端把
+    它塞进每个请求头 → 每个请求 401 → 页面"什么都点不动"，而 start.bat 的
+    鉴权自检（curl 不带 key）永远显示正常，问题被藏了很久。
+    注意只对**回环地址**容错：远程来源带错 key 仍然 401，安全边界不变。
+    """
     settings = get_settings()
     if not settings.auth_enabled:
         # 显式逃生舱（仅限本机开发）：所有请求共享匿名租户，任务归属 "local"
         return TenantContext.anonymous()
     key = _extract_key(request)
-    if not key:
-        raise HTTPException(401, "缺少 API Key（X-API-Key 请求头）")
+    if key:
+        ctx = await _resolve_tenant_by_key(request, key, strict=False)
+        if ctx is not None:
+            return ctx
+        # key 无效：仅回环地址回落到免密，远程来源照旧 401（不放松安全边界）
+        if _localhost_bypass_allowed(request, settings):
+            log.warning(
+                "客户端携带无效 API Key（%s…）但来自回环地址 —— 按本机免密放行到 default 租户。"
+                "常见原因：浏览器 localStorage 残留旧密钥（页面会在下次握手时自动清除）。",
+                key[:8])
+            return await _default_tenant(request)
+        raise HTTPException(401, "API Key 无效")
+    if _localhost_bypass_allowed(request, settings):
+        return await _default_tenant(request)
+    raise HTTPException(401, "缺少 API Key（X-API-Key 请求头）")
+
+
+def _localhost_bypass_allowed(request: Request, settings: Settings) -> bool:
+    """本机免密是否对该请求生效。"""
+    if not settings.auth_localhost_bypass:
+        return False
+    if getattr(request.app.state, "localhost_login_disabled", False):
+        # 运维/部署脚本主动关闭（例如想强制全链路走密钥）
+        return False
+    return _client_is_loopback(request, settings.trusted_proxy_hops)
+
+
+async def _default_tenant(request: Request) -> TenantContext:
+    """把免密请求落到 default 租户。
+
+    刻意**按库里的 default 租户解析**，而不是造一个游离的匿名租户：这样免密访问看到的
+    正是普通租户能看到的同一份数据（页面刷新、密钥切换、公网访问之间是一致的），
+    限流与每日 token 配额也照常作用在这个租户上 —— 免密不等于免配额。
+    """
+    repo: Repository = request.app.state.repo
+    row = await repo.get_tenant_by_name(DEFAULT_TENANT_NAME)
+    if row is None or not row["enabled"]:
+        # default 租户不存在（极端：库被清过）或已被禁用 —— 不静默放行，
+        # 明确报错并给出恢复路径，否则会表现为"页面能开但一个请求都发不出去"。
+        raise HTTPException(
+            401, "本机免密不可用：default 租户不存在或已被禁用。"
+                 "删除 data/api_credentials.json 后重启服务可重新引导，"
+                 "或改用 X-API-Key 请求头认证。")
+    return TenantContext(id=row["id"], name=row["name"],
+                         daily_token_quota=row["daily_token_quota"], via="localhost")
+
+
+async def _resolve_tenant_by_key(request: Request, key: str,
+                                 *, strict: bool = True) -> TenantContext | None:
+    """按明文 key 解析租户（唯一认证路径，供 require_tenant 调用）。
+
+    strict=True：key 无效直接抛 401（默认，保持既有语义）。
+    strict=False：key 无效返回 None，交由调用方决定是否回落到本机免密
+    （见 require_tenant 的"无效 key 容错"）。**租户被禁用仍是 403** ——
+    那说明 key 是真的、只是被停用，语义明确，不该被当成"无效"混过去。
+    """
     registry: TenantRegistry = request.app.state.tenants
     row = await registry.resolve(key)
     if row is None:
-        raise HTTPException(401, "API Key 无效")
+        if strict:
+            raise HTTPException(401, "API Key 无效")
+        return None
     if not row["enabled"]:
         raise HTTPException(403, "该租户已被禁用")
     return TenantContext(id=row["id"], name=row["name"],
-                         daily_token_quota=row["daily_token_quota"])
+                         daily_token_quota=row["daily_token_quota"], via="api_key")
 
 
 def _admin_key_from(request: Request) -> str:
@@ -183,8 +302,19 @@ async def bootstrap_auth(app, repo: Repository, settings: Settings) -> None:
     """
     if not settings.auth_enabled:
         app.state.admin_api_key = ""
+        app.state.localhost_login_disabled = True
         log.warning("AUTH_ENABLED=false：鉴权已关闭，任何人都可提交任务烧 token，仅限本机开发！")
         return
+
+    # 本机免密：状态显式落到 app.state，便于运维/测试在运行期关掉它，
+    # 也让启动日志能一句话说清"现在到底谁能免密进来"。
+    app.state.localhost_login_disabled = False
+    if settings.auth_localhost_bypass:
+        log.info("本机免密已启用：来自回环地址（127.0.0.1 / ::1）的请求无需 API Key，"
+                 "落到 default 租户；其他来源仍要求 X-API-Key。"
+                 "需要严格模式请设 AUTH_LOCALHOST_BYPASS=false")
+    else:
+        log.info("本机免密已关闭（AUTH_LOCALHOST_BYPASS=false）：所有来源都要求 X-API-Key")
 
     creds = _load_credentials(settings.credentials_file)
     admin_key = settings.admin_api_key or creds.get("admin_api_key") or ""

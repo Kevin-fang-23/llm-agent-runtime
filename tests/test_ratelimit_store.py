@@ -181,17 +181,28 @@ async def test_db_store_fail_open():
 # ---------------- 端到端：真实 lifespan + 中间件 ----------------
 
 def test_e2e_l1_db_store(db_client, monkeypatch):
-    """db 存储下 L1 每 IP 限流行为与 memory 一致：401×4 后 429。"""
-    monkeypatch.setenv("IP_RATE_LIMIT_PER_MIN", "5")
+    """db 存储下 L1 只拦写路径：读轮询豁免，写提交仍 429。
+
+    与 memory 存储保持同一语义（存储不同不应改变"读豁免"这一策略）；
+    写路径经 POST /api/tasks 验证，避免把 L2（租户分钟级）误当成 L1。
+    """
+    monkeypatch.setenv("IP_RATE_LIMIT_PER_MIN", "2")
+    monkeypatch.setenv("TENANT_SUBMIT_PER_MIN", "0")   # 关掉 L2，隔离被测层
     from app.config import get_settings
     get_settings.cache_clear()
     raw = db_client.raw
-    # 夹具建租户已占 1 次 → 再放行 4 次后触发；被拒的是无效 key 请求也照计数
-    codes = [raw.get("/api/tasks", headers={"X-API-Key": "bad"}).status_code
-             for _ in range(8)]
-    assert codes[0] == 401 and codes[3] == 401
-    assert codes[4] == 429 and codes[-1] == 429
-    assert raw.get("/api/tasks", headers={"X-API-Key": "bad"}).headers.get("Retry-After")
+    # 读路径豁免：连打 10 次（远超 limit=2）不出现 429。
+    # raw 不带租户 key，所以预期是 401（鉴权失败）—— 关键是**没有 429**。
+    read_codes = [raw.get("/api/tasks").status_code for _ in range(10)]
+    assert 429 not in read_codes, f"读路径不应被限流：{read_codes}"
+    # 写路径仍受限（db_client.post 自动携带租户 key）
+    write_codes = [db_client.post("/api/tasks",
+                                  json={"goal": "db L1 写限流", "mode": "react"}).status_code
+                   for _ in range(5)]
+    assert 429 in write_codes, f"写路径应被 L1 限流：{write_codes}"
+    last = db_client.post("/api/tasks", json={"goal": "db L1 写限流", "mode": "react"})
+    assert last.status_code == 429
+    assert last.headers.get("Retry-After")
     # 非 /api 路径不受限
     assert raw.get("/health").status_code == 200
 

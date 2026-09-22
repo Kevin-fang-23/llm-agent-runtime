@@ -11,7 +11,7 @@ import json
 import time
 from typing import Any
 
-from sqlalchemy import func, select, text
+from sqlalchemy import delete, func, select, text
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
@@ -165,6 +165,31 @@ class Repository:
             await session.commit()
             return _task_dict(task)
 
+    async def fail_interrupted_tasks(self, error: str,
+                                     statuses: tuple[str, ...] = _ACTIVE_STATUSES) -> int:
+        """启动清扫：把上次进程被杀时遗留的非终态任务置为 failed。
+
+        进程被杀（强关窗口 / 断电 / 调试时 taskkill）后，queued/running 任务会
+        **永远停在原状态**：本地队列不跨进程恢复，没人再把它们推进到终态。
+        更糟的是这些行还占着 L4 在途预占（tenant_token_usage 对活跃状态做
+        SUM(max_tokens)），孤儿越攒越多，当日 token 配额被整个锁死 —— 实测
+        3 个孤儿 × 60k 预占 → 新提交全部 429（Retry-After 直到午夜）。
+
+        只清 statuses 里的状态，**不碰 waiting_approval**：审批流靠 checkpoint
+        跨重启存活，等待用户点恢复的任务必须原样保留。celery 模式下 queued 行
+        可能在存活 broker 里，API 进程无权替它判死 —— 调用方负责按 queue_mode
+        gate（见 LocalTaskQueue.start）。
+        """
+        async with self.session_factory() as session:
+            rows = (await session.execute(
+                select(Task).where(Task.status.in_(statuses)))).scalars().all()
+            for t in rows:
+                t.status = "failed"
+                t.error = error
+                t.updated_at = time.time()
+            await session.commit()
+            return len(rows)
+
     async def get_task(self, task_id: str, tenant_id: str | None = None) -> dict | None:
         async with self.session_factory() as session:
             if tenant_id is None:
@@ -184,6 +209,35 @@ class Repository:
                 q = q.where(Task.tenant_id == tenant_id)
             rows = (await session.execute(q)).scalars().all()
             return [_task_dict(t) for t in rows]
+
+    async def delete_task(self, task_id: str, tenant_id: str | None = None) -> dict | None:
+        """删除任务**及其全部关联数据**（events / spans / tool_executions）。
+
+        为什么必须手工清理关联行：本 schema 刻意不给这三张表加外键（见 models.py
+        的说明 —— 事件与 span 要能独立于任务生命周期存在），所以删 tasks 行不会
+        级联，留下的行永远查不到、白占磁盘。三张表都有 task_id 索引/复合索引，
+        按 task_id 精确删，代价可控。
+
+        租户隔离与 get_task 同源：传了 tenant_id 时跨租户删除返回 None（上层
+        统一 404），不泄漏"这个任务 id 存在"。
+
+        返回被删任务的快照（调用方要记审计日志）；任务不存在时返回 None。
+        """
+        async with self.session_factory() as session:
+            if tenant_id is None:
+                task = await session.get(Task, task_id)
+            else:
+                task = (await session.execute(
+                    select(Task).where(Task.id == task_id,
+                                       Task.tenant_id == tenant_id))).scalars().first()
+            if task is None:
+                return None
+            snapshot = _task_dict(task)
+            await session.delete(task)
+            for model in (Event, Span, ToolExecution):
+                await session.execute(delete(model).where(model.task_id == task_id))
+            await session.commit()
+            return snapshot
 
     async def count_tasks_since(self, since: float,
                                 tenant_id: str | None = None) -> int:
@@ -438,8 +492,12 @@ class Repository:
 
 
 def _tenant_dict(t: Tenant) -> dict:
+    # api_key_hash 属于内部事实（bootstrap 比对凭据要用），一律原样返回；
+    # 对外脱敏在 API 边界做 —— routes_admin._public() 负责剥掉哈希，
+    # 任何接口都不把它回给客户端。
     return {
         "id": t.id, "name": t.name, "key_prefix": t.key_prefix,
+        "api_key_hash": t.api_key_hash,
         "enabled": t.enabled, "daily_token_quota": t.daily_token_quota,
         "created_at": t.created_at,
     }

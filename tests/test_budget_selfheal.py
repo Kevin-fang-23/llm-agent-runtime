@@ -68,7 +68,10 @@ async def test_token_budget_triggers_downgrade(settings, registry):
         {"final": "完成"},
     ]
     engine, llm = make_engine(settings, script, registry, event_sink=sink)
-    final = await engine.run_task("t6", "查资料", "react", 900, 24)
+    # 预算 900 是"恰好触发降级"的夹具值：每步 system 含 REACT_SYSTEM 准则 + 工具清单
+    # （含各工具的 description），随功能演进变长（2026-09-22 加检索策略准则 / source /
+    # freshness 说明），预算也要跟着调，否则降级后第二次仍超限 → budget_exceeded。
+    final = await engine.run_task("t6", "查资料", "react", 1400, 24)
 
     assert final["status"] == STATUS_DONE
     assert final["downgraded"] is True

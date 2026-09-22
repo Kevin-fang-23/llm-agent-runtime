@@ -11,9 +11,16 @@ class Settings(BaseSettings):
     model_config = SettingsConfigDict(env_file=".env", env_file_encoding="utf-8", extra="ignore")
 
     # LLM（OpenAI 兼容）
-    llm_base_url: str = "https://open.bigmodel.cn/api/paas/v4"
+    # 默认值 = 本项目**实际使用**的组合（阿里云百炼 / 千问），与 .env.example 模板保持一致。
+    # 为什么必须对齐：默认值代表"没有 .env 时指向哪家厂商"。此前默认指向智谱而 .env 用百炼，
+    # 一旦 .env 缺失或未被加载（新机器 / CI / Docker 未传环境变量），请求会**静默打到智谱**
+    # 且带着空 key，表现为"上游 401"—— 报错指向上游，会被误诊成"key 过期"。
+    # 凭据永远只来自 .env：llm_api_key 默认为空，未配置时应当**显式报错**而不是拿空 key 去打上游。
+    llm_base_url: str = "https://dashscope.aliyuncs.com/compatible-mode/v1"
     llm_api_key: str = ""
-    llm_model: str = "glm-4-flash"
+    llm_model: str = "qwen-plus"
+    # 留空 = 不降级（超预算直接终止汇报）。这是保守兜底，不随 .env 一起改，
+    # 免得"没配 .env"的环境顺带获得了它没要求的降级行为。
     llm_model_cheap: str = ""
 
     # 存储
@@ -71,11 +78,32 @@ class Settings(BaseSettings):
     # auth_enabled 默认开启（默认安全）：关闭它等于把「任何人可提交任务烧 token」敞开，
     # 仅限本机开发，与 ALLOW_UNSAFE_LOCAL_EXEC 同一性质的选择。
     auth_enabled: bool = True
+    # 本机（回环地址）免密放行：默认开启。
+    #
+    # 解决的问题：一键启动脚本拉起服务后浏览器打开 127.0.0.1:8000，页面右上角却要求
+    # 手填 X-API-Key（该 key 只在 data/api_credentials.json 里，且启动脚本不该把它
+    # 回显到终端/写进页面）—— 演示体验因此断在第一步。
+    #
+    # 为什么是「按来源地址判定」而不是直接 auth_enabled=false：
+    #   * 回环地址只可能是本机进程发起的请求（浏览器/curl/本机脚本），放行它们等于
+    #     「本机零配置可用」，正是双击启动想要的；
+    #   * 一旦经 ngrok / 反向代理暴露到公网，request.client.host 是代理或真实远端 IP，
+    #     **不是**回环地址 → 仍然要求密钥。也就是说这个开关不会在"把地址发给别人"
+    #     的那一刻把 LLM 账单敞开。
+    # 需要严格模式（本机也要密钥）时设 AUTH_LOCALHOST_BYPASS=false 即可。
+    auth_localhost_bypass: bool = True
+    # 显式声明「可信代理」数量：置 >1 时才信任 X-Forwarded-For 的右侧第 N 跳。
+    # 默认 0 = **完全不信任**该头（客户端可随意伪造它，信了等于把鉴权交给攻击者）。
+    # 只有在你自己控制的反向代理后面、且代理会覆写该头时才设置。
+    trusted_proxy_hops: int = 0
     # 管理员密钥：留空则首次启动生成并写入 credentials_file（env 优先于文件）
     admin_api_key: str = ""
     credentials_file: str = str(PROJECT_ROOT / "data/api_credentials.json")
-    # 新租户默认每日 token 配额（0 = 不限）
-    tenant_default_daily_token_quota: int = 200_000
+    # 新租户默认每日 token 配额（0 = 不限）。
+    # 2026-09-22 由 200_000 上调至 2_000_000：一次深检索任务实耗 6万~13万 token
+    # （多轮搜索 + 长上下文），20 万只够 2~3 个深任务/天，正常使用半天即触顶。
+    # 200 万 ≈ 25 个深任务或数百个轻任务，防滥用由 L1~L3 与日总量上限继续兜底。
+    tenant_default_daily_token_quota: int = 2_000_000
 
     # 限流：分钟级用限流器（memory = 进程内滑动窗口 / db = 业务库固定窗口），
     # 日级额度以 tasks 表实数聚合（判定依据即事实来源，重启/多 worker 都不会漂，
@@ -83,10 +111,10 @@ class Settings(BaseSettings):
     # （uvicorn --workers N / 多副本）应设 db —— 否则突发额度 = 单实例 × worker 数。
     # 0 = 关闭该层
     rate_limit_store: str = "memory"    # L1/L2 计数存储：memory | db
-    ip_rate_limit_per_min: int = 120       # L1 每 IP 每分钟（/api/* 全部端点）
-    tenant_submit_per_min: int = 10        # L2 每租户每分钟提交任务数
-    tenant_daily_task_limit: int = 200     # L2b 每租户每日提交任务数
-    global_daily_task_limit: int = 1000    # L3 全局每日提交任务数（资金护栏）
+    ip_rate_limit_per_min: int = 120       # L1 每 IP 每分钟（/api/* 全部端点）—— 最外层防滥用，保持不变
+    tenant_submit_per_min: int = 20        # L2 每租户每分钟提交任务数（10 → 20，提交本身不产生模型成本）
+    tenant_daily_task_limit: int = 500     # L2b 每租户每日提交任务数（200 → 500）
+    global_daily_task_limit: int = 3000    # L3 全局每日提交任务数（资金护栏，1000 → 3000）
 
     # 可观测性（P2-5）
     # 日志：json = 单行结构化（采集器直接解析字段）；text = 人类可读旧格式
@@ -131,8 +159,13 @@ class Settings(BaseSettings):
     tool_db_path: str = str(PROJECT_ROOT / "data/demo.sqlite")
     workspace_dir: str = str(PROJECT_ROOT / "data/workspace")
     # 默认 mock 是刻意选择：不配 .env 的调用方（含全部测试与离线脚本）必须不出网。
-    # auto 会按 sogou → bing 依次尝试，用相关性校验挑第一个可用的源。
-    search_provider: str = "mock"  # mock | auto | sogou | bing | ddgs
+    # auto 会按 bocha（若配了 key）→ sogou → bing → ddgs 依次尝试，
+    # 用相关性校验挑第一个可用的源。
+    search_provider: str = "mock"  # mock | auto | bocha | sogou | bing | ddgs
+    # 博查 Web Search API（可选）：配了 key 才会启用，auto 会优先用它 ——
+    # 免 key 的网页抓取源（sogou/bing）存在反爬限流与"年份词条"退化，正式 API 更稳。
+    # 申请：https://open.bocha.cn → API KEY 管理。留空则完全跳过该源（零配置开箱可用）。
+    bocha_api_key: str = ""
     tool_timeout_s: float = 30.0
     max_concurrent_tools: int = 4
 

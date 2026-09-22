@@ -162,7 +162,11 @@ WEB_DIR = Path(__file__).resolve().parents[1] / "web"
 
 @app.get("/", include_in_schema=False)
 async def index():
-    return FileResponse(WEB_DIR / "index.html")
+    # no-cache = 每次协商（配 ETag 走 304），而不是让浏览器按启发式规则长期
+    # 复用本地副本。本地演示页前端改得频繁，若不显式声明，浏览器可能拿旧
+    # index.html（旧 JS 逻辑）当新页面用 —— 表现是"你改了但我这儿没生效"。
+    return FileResponse(WEB_DIR / "index.html",
+                        headers={"Cache-Control": "no-cache"})
 
 
 @app.get("/health", include_in_schema=False)

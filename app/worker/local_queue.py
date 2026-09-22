@@ -32,6 +32,16 @@ class LocalTaskQueue:
         self._traces: dict[str, str | None] = {}
 
     async def start(self) -> None:
+        # 启动清扫（仅 local 模式）：上次进程被杀遗留的 queued/running/resuming
+        # 任务永远不会被执行，却占着 L4 在途预占把当日 token 配额锁死（实测
+        # 3 孤儿 × 60k → 新提交全 429 到午夜）。这里一次性置 failed 释放预占。
+        # waiting_approval 不清：审批流靠 checkpoint 跨重启存活，任务原样保留。
+        # celery 模式不清扫：queued 行可能在存活 broker 里，本进程无权替它判死。
+        if self.settings.queue_mode == "local":
+            n = await self.repo.fail_interrupted_tasks(
+                "服务重启导致任务中断（可从断点恢复）")
+            if n:
+                log.warning("启动清扫：已将 %d 个上次运行遗留的 queued/running 任务标记为 failed", n)
         self._worker = asyncio.create_task(self._consume_loop(), name="local-queue-worker")
 
     async def stop(self) -> None:

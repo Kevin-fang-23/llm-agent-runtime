@@ -4,11 +4,15 @@
 
 | 层 | 作用域 | 实现 | 位置 |
 |----|--------|------|------|
-| L1 | 每 IP 每分钟（/api/*） | 限流器（memory / db） | 本模块中间件 |
+| L1 | 每 IP 每分钟（/api/* 的**写操作**） | 限流器（memory / db） | 本模块中间件 |
 | L2 | 每租户每分钟提交 | 限流器（memory / db） | create_task |
 | L2b | 每租户每日提交数 | tasks 表实数聚合 | create_task |
 | L3 | 全局每日提交数（资金护栏） | tasks 表实数聚合 | create_task |
 | L4 | 每租户每日 token 配额 | tasks 表实耗 + 在途预占 | create_task |
+
+L1 只拦写操作（GET/HEAD/OPTIONS 豁免，含 SSE 推送）。原因见
+`PerIpRateLimitMiddleware` 的类 docstring：读与写共享同一 IP 预算会互相挤压，
+演示页自身的轮询会把额度吃满，导致"提交失败"这类难以归因的误报。
 
 两种存储（RATE_LIMIT_STORE，见 app/config.py）：
 
@@ -108,18 +112,47 @@ class DbWindowLimiter:
 
 
 class PerIpRateLimitMiddleware:
-    """L1：每 IP 每分钟对 /api/* 全部端点限流（含无效 key 的撞库请求）。
+    """L1：每 IP 每分钟对 /api/* 的**写操作**限流（含无效 key 的撞库请求）。
 
     纯 ASGI 中间件：在鉴权**之前**执行，认证失败的高频请求同样被计数 ——
     撞库请求若不限流，鉴权 DB 查询（缓存未命中时）本身就会被打满。
+
+    为什么只拦写操作（读路径豁免，read_exempt=True）
+    ------------------------------------------------
+    读与写共用一个 IP 预算会互相挤压：演示页每 4 秒轮询一次列表 + 指标，
+    外加 SSE 流结束回跳，一屏就能把额度吃满 —— 一旦越界，用户看到的
+    是"提交失败"，而真正被拒的可能是无关的轮询请求。更糟的是，被拒的
+    恰恰是**列表轮询**时，页面表现为"数据不动 + 偶发未授权"，很难归因。
+
+    安全性没有削弱，因为：
+
+    * **撞库仍然被限流**。撞库打在带鉴权的端点上是靠 key 撞库，而拿一个
+      无效 key 去打 GET /api/tasks 同样要过 require_tenant 的 DB 查询 ——
+      但那是"每 IP 每分钟 120 次读"都被放过吗？不是：豁免的只是 L1 这一层，
+      require_tenant 的**负缓存**（TenantRegistry）才是挡住撞库的主力 ——
+      无效 key 只查一次库就进缓存，后续直接命中缓存，不打 DB。
+    * **资金护栏不在这层**。真正防止烧 token 的是 L2b/L3/L4（tasks 表实数聚合
+      + 在途预占），它们作用于**提交**（写）路径，完全不受本豁免影响。
+    * **写操作照旧受限**。POST /api/tasks、/api/tasks/{id}/cancel 等仍走
+      ip_rate_limit_per_min，突发提交依然被拦。
+
+    需要恢复"读写全拦"的严格模式时，把 read_exempt 置 False（测试用）。
     """
     exempt_paths = ("/health", "/")
+    # 读路径豁免：这些端点是轮询/推送的常规消耗，不是攻击面
+    _READ_METHODS = ("GET", "HEAD", "OPTIONS")
 
-    def __init__(self, app):
+    def __init__(self, app, read_exempt: bool = True):
         self.app = app
+        self.read_exempt = read_exempt
 
     async def __call__(self, scope, receive, send):
         if scope["type"] != "http" or not scope.get("path", "").startswith("/api"):
+            await self.app(scope, receive, send)
+            return
+        if self.read_exempt and scope.get("method", "GET").upper() in self._READ_METHODS:
+            # 只读轮询不计入 L1：避免"页面自己把额度吃满"导致的误报限流。
+            # 鉴权与租户配额照常生效（本中间件在鉴权之前，这里只是不计数）。
             await self.app(scope, receive, send)
             return
         settings = get_settings()

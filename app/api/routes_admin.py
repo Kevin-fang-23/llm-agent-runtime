@@ -19,6 +19,11 @@ def _deps(request: Request):
     return request.app.state.repo, request.app.state.tenants
 
 
+def _public(tenant: dict) -> dict:
+    """对外脱敏：租户字典剥掉 api_key_hash（仓储层为 bootstrap 便利会带上）。"""
+    return {k: v for k, v in tenant.items() if k != "api_key_hash"}
+
+
 @router.post("/tenants", status_code=201)
 async def create_tenant(body: TenantCreate, request: Request):
     repo, registry = _deps(request)
@@ -28,13 +33,13 @@ async def create_tenant(body: TenantCreate, request: Request):
         new_tenant_id(), body.name, hash_api_key(key), prefix,
         body.daily_token_quota if body.daily_token_quota is not None
         else settings.tenant_default_daily_token_quota)
-    return {**tenant, "api_key": key}  # 明文 key 仅此一次
+    return {**_public(tenant), "api_key": key}  # 明文 key 仅此一次
 
 
 @router.get("/tenants")
 async def list_tenants(request: Request):
     repo, _ = _deps(request)
-    return await repo.list_tenants()  # 不含任何密钥字段
+    return [_public(t) for t in await repo.list_tenants()]  # 不含任何密钥字段
 
 
 @router.patch("/tenants/{tenant_id}")
@@ -47,7 +52,7 @@ async def patch_tenant(tenant_id: str, body: TenantPatch, request: Request):
     if tenant is None:
         raise HTTPException(404, "租户不存在")
     registry.invalidate_tenant(tenant_id)  # 禁用/改配额必须立即生效，不能吃旧缓存
-    return tenant
+    return _public(tenant)
 
 
 @router.post("/tenants/{tenant_id}/rotate")
@@ -59,7 +64,7 @@ async def rotate_key(tenant_id: str, request: Request):
     if tenant is None:
         raise HTTPException(404, "租户不存在")
     registry.invalidate_tenant(tenant_id)
-    return {**tenant, "api_key": key}  # 新明文 key 仅此一次；旧 key 立即失效
+    return {**_public(tenant), "api_key": key}  # 新明文 key 仅此一次；旧 key 立即失效
 
 
 @router.get("/tenants/{tenant_id}/usage")

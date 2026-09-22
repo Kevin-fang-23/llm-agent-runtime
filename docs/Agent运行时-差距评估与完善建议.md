@@ -2095,3 +2095,45 @@ finisher 随之走计划汇总分支（比旧版多一次 LLM 调用）——
 
 
 
+
+---
+
+# 附录十六：一键启动崩溃修复——bootstrap_auth 的 KeyError（2026-09-21 第四轮）
+
+## 现象
+
+双击 `scripts\start.bat`：服务窗口弹出了，但 60 秒就绪探测超时，网页打不开。
+前台直跑 uvicorn 复现到根因——lifespan 启动即崩：
+
+```
+File "app\api\security.py", line 199, in bootstrap_auth
+    row["api_key_hash"] == hash_api_key(default_key):
+KeyError: 'api_key_hash'
+```
+
+## 根因
+
+`Repository._tenant_dict()` 刻意不返回 `api_key_hash`（当初为了"列表接口不泄漏哈希"
+把脱敏做在了仓储层），但 `bootstrap_auth` 走"库中已有 default 租户 + 凭据文件 key
+与库一致"分支时需要拿哈希比对 → `row["api_key_hash"]` KeyError → lifespan 失败 →
+服务退出 → 就绪探测永远等不到。
+
+**为什么 380 条测试没拦住**：每次测试都用全新临时库，bootstrap 只会走"首次创建"分支；
+"第二次启动且文件 key 匹配"这个分支此前没有任何用例覆盖——而真实 `data/agent.db`
+第二次启动（哪怕只是重启服务）必然踩中。这是典型的"测试环境自洽、真实数据路径漏测"。
+
+## 修复（分层归位）
+
+| 文件 | 改动 |
+|---|---|
+| `app/storage/repository.py` | `_tenant_dict()` 补回 `api_key_hash`——哈希是内部事实，仓储层原样返回 |
+| `app/api/routes_admin.py` | 新增 `_public()`：管理 API 边界统一剥掉 `api_key_hash`（list/create/patch/rotate 四个端点）——**脱敏的正确位置是 API 边界，不是仓储层** |
+| `tests/test_auth_multitenant.py` | 新增回归用例 `test_bootstrap_second_startup_is_idempotent`：同一业务库第二次启动必须不崩溃、不轮换 key、文件凭据仍可用（对修复前代码必现 KeyError） |
+
+## 验证
+
+| 项 | 结果 |
+|---|---|
+| 全量套件 | 380 passed, 10 skipped（含新回归用例） |
+| start.bat 端到端 | 服务就绪，`GET / → 200`、`/health → {"status":"ok"}`、带 default 租户 key 的 `GET /api/tasks → 200` |
+| 编码/环境排查 | start.bat 本体为 ANSI(GBK)+CRLF 无损；PATH 上的 `python` 是 anaconda base（3.8，无依赖），脚本按设计顺延选中 conda `agent-runtime` 解释器——脚本逻辑无罪，问题全在应用启动崩溃 |
