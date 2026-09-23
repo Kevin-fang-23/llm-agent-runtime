@@ -13,6 +13,7 @@
 """
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import time
@@ -55,11 +56,41 @@ def estimate_messages_tokens(messages: list[dict]) -> int:
     return total
 
 
+def estimate_call_tokens(messages: list[dict], completion: str = "") -> int:
+    """统一的 LLM 调用 token 口径：输入估算 + 输出估算。
+
+    真实模型有 usage 时以 total_tokens 为准，本函数只在 usage 缺失时兜底；
+    假模型没有 usage，直接就是唯一口径。旧实现两边一个 `输入*2`、一个
+    `输入+50`，离线（测试/演示）与在线的 tokens_used 量级互不可比，
+    而 tokens_used 同时喂给预算控制与 L4 配额判定。
+    """
+    return estimate_messages_tokens(messages) + estimate_tokens(completion)
+
+
 @dataclass
 class ToolCallRequest:
     id: str
     name: str
     arguments: dict[str, Any]
+    # 模型输出的 arguments 不是合法 JSON 时的错误描述（含原始文本截断）。
+    # 空串 = 解析正常。不在解析层抛异常：那会绕过整条自愈契约把任务直接判死，
+    # 而截断/带围栏的 arguments 恰是小模型最常见的失败形态，交参数修复循环处理。
+    args_parse_error: str = ""
+
+
+def _parse_tool_arguments(raw: str) -> tuple[dict[str, Any], str]:
+    """把模型给出的 arguments 文本解析成 dict。返回 (参数, 解析错误说明)。
+
+    失败时参数退化为空 dict、错误说明回喂自愈修复器（repair prompt 里能看到原文）。
+    """
+    try:
+        parsed = json.loads(raw)
+    except (json.JSONDecodeError, TypeError) as e:
+        return {}, f"模型输出的 tool arguments 不是合法 JSON（{e}）；原始文本: {raw[:500]}"
+    if not isinstance(parsed, dict):
+        return ({}, ("模型输出的 tool arguments 不是 JSON 对象"
+                     f"（实际是 {type(parsed).__name__}）；原始文本: {raw[:500]}"))
+    return parsed, ""
 
 
 @dataclass
@@ -79,15 +110,59 @@ class ChatLLM(Protocol):
     ) -> LLMResponse: ...
 
 
-class OpenAIChatLLM:
-    """OpenAI 兼容异步客户端。model 参数允许运行时降级切换。"""
+def _is_retryable_llm_error(exc: BaseException) -> bool:
+    """模型调用失败里值得重试的部分：连接/超时类、429、5xx。
 
-    def __init__(self, base_url: str, api_key: str, default_model: str, fallback_model: str = ""):
+    其余（401 鉴权、400 请求非法等）同一 key 换模型也一样失败，重试只是拖延。
+    openai 异常惰性导入：判定逻辑不与模块导入绑死。
+    """
+    try:
+        from openai import APIConnectionError, APIStatusError, RateLimitError
+    except ImportError:
+        return False
+    # APITimeoutError 是 APIConnectionError 的子类
+    if isinstance(exc, APIConnectionError):
+        return True
+    if isinstance(exc, RateLimitError):
+        return True
+    return isinstance(exc, APIStatusError) and exc.status_code >= 500
+
+
+def _llm_retry_delay(exc: BaseException, attempt: int, base_s: float) -> float:
+    """退避时长：上游 Retry-After 优先，但**必须封顶**——上游回 86400 秒
+    不能让事件循环睡一天（对齐 H4 的教训：hint 无界是缺陷而非特性）。"""
+    from app.core.errors import parse_retry_after
+
+    hint = None
+    headers = getattr(getattr(exc, "response", None), "headers", None)
+    if headers is not None:
+        hint = parse_retry_after(headers.get("retry-after"))
+    delay = hint if hint is not None else base_s * (2 ** max(0, attempt - 1))
+    return min(delay, 30.0)
+
+
+class OpenAIChatLLM:
+    """OpenAI 兼容异步客户端。model 参数允许运行时降级切换。
+
+    出网防护（此前整层裸奔：无超时、无重试，一次网络抖动即判死整个任务）：
+      - 显式 timeout：openai SDK 默认 600s 对交互式任务形同无限等待；
+      - SDK 内置重试关闭（max_retries=0），退避重试收编到本层：SDK 的重试
+        不会切降级模型，且把失败尝试藏进成功计时里，LLM_CALLS 的 error 口径失真；
+      - 可重试类失败（连接/超时/429/5xx）用尽后，若配了 fallback_model，
+        自动换模型再试一轮——fallback 只救瞬时故障，鉴权/参数类直接上抛。
+    """
+
+    def __init__(self, base_url: str, api_key: str, default_model: str, fallback_model: str = "",
+                 timeout_s: float = 60.0, max_retries: int = 2):
         from openai import AsyncOpenAI
 
-        self.client = AsyncOpenAI(base_url=base_url, api_key=api_key or "EMPTY")
+        self.client = AsyncOpenAI(base_url=base_url, api_key=api_key or "EMPTY",
+                                  timeout=timeout_s, max_retries=0)
         self.default_model = default_model
         self.fallback_model = fallback_model
+        self.max_retries = max(0, max_retries)
+        # 退避基数与测试钩子对齐（测试里设 0 免等）
+        self.retry_base_delay_s = 1.0
 
     async def chat(
         self,
@@ -95,47 +170,96 @@ class OpenAIChatLLM:
         tools: list[dict] | None = None,
         model: str | None = None,
     ) -> LLMResponse:
-        chosen = model or self.default_model
+        primary = model or self.default_model
+        chain = [primary]
+        if self.fallback_model and self.fallback_model != primary:
+            chain.append(self.fallback_model)
+        for i, chosen in enumerate(chain):
+            try:
+                return await self._chat_once(chosen, messages, tools)
+            except Exception as e:
+                if i + 1 >= len(chain) or not _is_retryable_llm_error(e):
+                    raise
+                log.warning("模型 %s 重试后仍失败，降级到 %s: %s",
+                            chosen, chain[i + 1], e)
+        raise RuntimeError("unreachable：候选链最后一个必然 return 或 raise")
+
+    async def _chat_once(
+        self, chosen: str, messages: list[dict], tools: list[dict] | None,
+    ) -> LLMResponse:
         kwargs: dict[str, Any] = {"model": chosen, "messages": messages, "temperature": 0.2}
         if tools:
             kwargs["tools"] = tools
         # ---- LLM 调用级 span 的起点（唯一真实出网点，见模块 docstring）----
         label = _model_label(chosen)
         started = time.perf_counter()
+        attempts = 0
         with obs_spans.span(obs_spans.KIND_LLM, "chat", attributes={"model": label}) as sp:
-            try:
-                resp = await self.client.chat.completions.create(**kwargs)
-            except BaseException:
-                # 出网失败同样要计数与观测：失败率（outcome=error）是这层最重要的信号，
-                # 漏掉异常路径会让"上游挂了"表现为"指标一切正常、只是没有数据"
-                sp.set_status("error")
-                sp.set_attribute("error", "upstream")
-                obs_metrics.LLM_CALLS.inc({"model": label, "outcome": "error"})
-                obs_metrics.LLM_DURATION.observe(time.perf_counter() - started, {"model": label})
-                log.warning("LLM 调用失败 model=%s elapsed_ms=%d", chosen,
-                            int((time.perf_counter() - started) * 1000), exc_info=True)
-                raise
+            while True:
+                attempts += 1
+                attempt_started = time.perf_counter()
+                try:
+                    resp = await self.client.chat.completions.create(**kwargs)
+                    break
+                except BaseException as e:
+                    # 每次真实出网失败都计数：失败率（outcome=error）是这层最重要的
+                    # 信号，藏在重试背后会让"上游挂了"表现为"指标一切正常、只是没数据"。
+                    # CancelledError 等非 Exception 不满足可重试判定，原样上抛。
+                    obs_metrics.LLM_CALLS.inc({"model": label, "outcome": "error"})
+                    obs_metrics.LLM_DURATION.observe(
+                        time.perf_counter() - attempt_started, {"model": label})
+                    log.warning("LLM 调用失败 model=%s attempt=%d elapsed_ms=%d", chosen,
+                                attempts,
+                                int((time.perf_counter() - attempt_started) * 1000),
+                                exc_info=True)
+                    # CancelledError 等非 Exception 不满足可重试判定，走上面的 raise
+                    if not _is_retryable_llm_error(e) or attempts > self.max_retries:
+                        sp.set_status("error")
+                        sp.set_attribute("error", "upstream")
+                        sp.set_attribute("attempts", attempts)
+                        raise
+                    await asyncio.sleep(
+                        _llm_retry_delay(e, attempts, self.retry_base_delay_s))
             msg = resp.choices[0].message
-            calls = [
-                ToolCallRequest(
-                    id=tc.id,
-                    name=tc.function.name,
-                    arguments=json.loads(tc.function.arguments or "{}"),
-                )
-                for tc in (msg.tool_calls or [])
-            ]
+            calls = []
+            for tc in (msg.tool_calls or []):
+                raw = tc.function.arguments or "{}"
+                args, parse_err = _parse_tool_arguments(raw)
+                calls.append(ToolCallRequest(id=tc.id, name=tc.function.name,
+                                             arguments=args, args_parse_error=parse_err))
             usage = getattr(resp, "usage", None)
-            tokens = getattr(usage, "total_tokens", 0) if usage else estimate_messages_tokens(messages) * 2
+            if usage:
+                tokens = getattr(usage, "total_tokens", 0)
+            else:
+                # usage 缺失：与假模型同一口径估算（输入 + 本次输出文本，
+                # 输出含工具调用参数；解析失败的原始文本也计入，不漏计）
+                completion = (msg.content or "") + "".join(
+                    json.dumps(c.arguments, ensure_ascii=False) + c.args_parse_error
+                    for c in calls)
+                tokens = estimate_call_tokens(messages, completion)
             elapsed = time.perf_counter() - started
             sp.set_attribute("tokens", tokens)
             sp.set_attribute("tool_calls", len(calls))
+            sp.set_attribute("attempts", attempts)
             obs_metrics.LLM_CALLS.inc({"model": label, "outcome": "ok"})
             obs_metrics.LLM_DURATION.observe(elapsed, {"model": label})
             obs_metrics.LLM_TOKENS.inc({"model": label}, float(tokens))
-            log.info("LLM 调用 model=%s elapsed_ms=%d tokens=%d tool_calls=%d",
-                     chosen, int(elapsed * 1000), tokens, len(calls))
+            log.info("LLM 调用 model=%s elapsed_ms=%d tokens=%d tool_calls=%d attempts=%d",
+                     chosen, int(elapsed * 1000), tokens, len(calls), attempts)
             return LLMResponse(text=msg.content or "", tool_calls=calls, model=chosen,
                                tokens_used=tokens)
+
+
+def _script_completion_text(item: dict) -> str:
+    """假模型脚本项的"输出"文本：正文（回答/最终答案/思考）+ 工具调用参数。
+
+    与真实客户端 usage 缺失时的兜底口径对称（content + arguments JSON），
+    两边共用 estimate_call_tokens，估算量级才可比。
+    """
+    calls = [item["tool"]] if "tool" in item else list(item.get("tools") or [])
+    text = item.get("text") or item.get("final") or item.get("thought") or ""
+    return text + "".join(json.dumps(c.get("arguments", {}), ensure_ascii=False)
+                          for c in calls)
 
 
 class FakeScriptedLLM:
@@ -165,9 +289,10 @@ class FakeScriptedLLM:
         model: str | None = None,
     ) -> LLMResponse:
         started = time.perf_counter()
-        self.calls.append({"messages": list(messages), "tools": tools, "model": model})
         item = self.script.pop(0) if self.script else {"final": "(脚本耗尽)"}
-        tokens = estimate_messages_tokens(messages) + 50
+        tokens = estimate_call_tokens(messages, _script_completion_text(item))
+        self.calls.append({"messages": list(messages), "tools": tools,
+                           "model": model, "tokens": tokens})
         raw_calls = []
         if "tool" in item:
             raw_calls = [item["tool"]]

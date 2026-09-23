@@ -224,7 +224,7 @@ async def test_antispider_page_reported_as_rate_limited(monkeypatch):
         return _FakeResp(ANTISPIDER_HTML)
 
     monkeypatch.setattr(httpx.AsyncClient, "get", fake_get)
-    monkeypatch.setattr(ws, "_MIN_INTERVAL_S", 0)
+    monkeypatch.setattr(ws.throttle, "_MIN_INTERVAL_S", 0)   # D5 拆包：节流常量在 throttle 模块生效
     with pytest.raises(ToolExecutionError) as ei:
         await ws._sogou_search("任意查询", 3)
     assert ei.value.code is ToolErrorCode.RATE_LIMITED
@@ -263,7 +263,7 @@ async def test_normal_page_is_not_mistaken_for_block(monkeypatch):
         return _FakeResp(big)
 
     monkeypatch.setattr(httpx.AsyncClient, "get", fake_get)
-    monkeypatch.setattr(ws, "_MIN_INTERVAL_S", 0)
+    monkeypatch.setattr(ws.throttle, "_MIN_INTERVAL_S", 0)   # D5 拆包：节流常量在 throttle 模块生效
     out = await ws._sogou_search("北京天气", 3)
     assert out["result"]
 
@@ -276,7 +276,7 @@ async def test_throttle_enforces_min_interval(monkeypatch):
     """
     from app.tools import web_search as ws
 
-    monkeypatch.setattr(ws, "_MIN_INTERVAL_S", 0.25)
+    monkeypatch.setattr(ws.throttle, "_MIN_INTERVAL_S", 0.25)
     t0 = time.monotonic()
     await ws._gate("sogou", "搜狗搜索")
     await ws._gate("sogou", "搜狗搜索")          # 第二次应被强制等待

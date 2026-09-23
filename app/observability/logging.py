@@ -72,8 +72,11 @@ DEFAULT_REDACT_PATTERNS: tuple[str, ...] = (
     # 连接串里的密码部分：**只遮蔽密码**，保留 scheme://user@host:port/db 结构，
     # 否则日志会失去"连的是哪个库"这个关键排查信息
     r"(?i)\b(postgres(?:ql)?|mysql|redis|amqp)://([^:/\s@]+):([^@\s]+)@",
-    # 赋值式密钥：key/secret/token/password = value（YAML/JSON/env 三种写法都覆盖）
-    r"(?i)\b(api[_-]?key|apikey|secret|token|password|passwd|pwd)\b\s*[:=]\s*"
+    # 赋值式密钥：key/secret/token/password = value（YAML/JSON/env 三种写法都覆盖）。
+    # C5：前导边界不用 \b —— `_` 是词字符，`BOCHA_API_KEY=xxx` 里 "API" 前是 "_"，
+    # \b 不成立导致整条规则失配、密钥原样进日志。改用"前面不是字母/数字"的
+    # lookbehind：下划线/连字符分隔的 env 式键名照常命中，`fpwd` 这类字母粘连仍挡住。
+    r"(?i)(?<![A-Za-z0-9])(api[_-]?key|apikey|secret|token|password|passwd|pwd)\b\s*[:=]\s*"
     r"[\"']?([A-Za-z0-9._\-/+]{8,})[\"']?",
     # 中国大陆手机号（1 开头 11 位）
     r"\b1[3-9]\d{9}\b",
@@ -87,8 +90,8 @@ DEFAULT_REDACT_PATTERNS: tuple[str, ...] = (
 # 需要"保留结构、只遮蔽值"的规则在此登记 —— 声明式表达比在正则里写死 \1\2 更可读，
 # 也避免 `\2=[REDACTED]` 这类替换串在 f-string 里被转义搞错。
 _KEEP_GROUPS: dict[str, tuple[int, ...]] = {
-    # 赋值式：保留 key 名（第 1 组），遮蔽 value（第 2 组）
-    r"(?i)\b(api[_-]?key|apikey|secret|token|password|passwd|pwd)\b\s*[:=]\s*"
+    # 赋值式：保留 key 名（第 1 组），遮蔽 value（第 2 组）。键串须与规则原文一致
+    r"(?i)(?<![A-Za-z0-9])(api[_-]?key|apikey|secret|token|password|passwd|pwd)\b\s*[:=]\s*"
     r"[\"']?([A-Za-z0-9._\-/+]{8,})[\"']?": (1,),
     # X-API-Key：保留键名，遮蔽值
     r"(?i)\bx-api-key\b\s*[:=]\s*[\"']?([A-Za-z0-9._\-]{8,})[\"']?": (),

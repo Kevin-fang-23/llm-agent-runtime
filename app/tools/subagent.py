@@ -21,10 +21,8 @@ from langgraph.checkpoint.memory import MemorySaver
 
 from app.config import Settings
 from app.core.errors import ToolErrorCode
-from app.graph.engine import AgentEngine, _current_task_id
+from app.graph.engine import AgentEngine, _current_engine, _current_task_id
 from app.tools.registry import ToolExecutionError
-
-# 工厂在注册时注入：parent_engine 由 AgentEngine.__init__ 自动回填（见 attach_parent_engine）
 
 
 def make_subagent_handler(
@@ -48,7 +46,9 @@ def make_subagent_handler(
                         settings.subagent_max_steps)
         child_id = f"sub-{uuid.uuid4().hex[:8]}"
         parent_task_id = _current_task_id.get()
-        parent_engine: AgentEngine | None = getattr(handler, "parent_engine", None)
+        # C3：从调用方上下文取父引擎，而不是往共享注册表的 handler 上写死引用——
+        # 同一注册表被多个引擎复用时，后构建的引擎会顶掉前者的转发生效目标。
+        parent_engine: AgentEngine | None = _current_engine.get()
 
         async def child_sink(ev: dict) -> None:
             if parent_engine is None:
@@ -96,15 +96,6 @@ def make_subagent_handler(
     return handler
 
 
-def attach_parent_engine(registry, engine: AgentEngine) -> None:
-    """引擎构建后把自身回填给 subagent 工具（用于子事件转发到父轨迹）。"""
-    try:
-        spec = registry.get("subagent")
-    except ToolExecutionError:
-        return
-    spec.handler.parent_engine = engine
-
-
 SUBAGENT_SPEC_KWARGS = dict(
     name="subagent",
     description=(
@@ -124,4 +115,5 @@ SUBAGENT_SPEC_KWARGS = dict(
     },
     key_result=True,
     key_output_limit=1500,
+    side_effect=True,  # 会派生整个子执行树（真实消耗 LLM 配额与工具调用）
 )

@@ -41,4 +41,5 @@ CODE_RUN_SPEC_KWARGS = dict(
         },
         "required": ["code"],
     },
+    side_effect=True,  # 执行任意代码（本地回退模式下还可读宿主文件系统）
 )

@@ -8,6 +8,7 @@
 from __future__ import annotations
 
 import asyncio
+import re
 import sqlite3
 from pathlib import Path
 from typing import Any
@@ -20,21 +21,47 @@ _FORBIDDEN = (
     "detach", "pragma", "vacuum", "reindex", "replace", "grant", "revoke",
 )
 
+# C1：黑名单在**骨架 SQL** 上跑 —— 先剥字符串字面量与注释，再按词边界匹配。
+# 旧实现 `" kw "` 的裸子串检查可被 `/*insert*/`、换行/制表符包围、`insert(`
+# 直接绕过；剥字面量同时消除误杀（WHERE note='请删除旧数据' 是合法查询）。
+_STRIP_COMMENT = re.compile(r"--[^\n]*|/\*.*?\*/", re.S)
+_STRIP_LITERAL = re.compile(r"'(?:[^']|'')*'")
+
+
+def _sql_skeleton(sql: str) -> str:
+    return _STRIP_LITERAL.sub("''", _STRIP_COMMENT.sub(" ", sql)).lower()
+
 
 def validate_readonly_sql(sql: str) -> str:
     cleaned = sql.strip().rstrip(";").strip()
     if not cleaned:
         raise ValueError("SQL 不能为空")
-    if ";" in cleaned:
+    skeleton = _sql_skeleton(cleaned)
+    if ";" in skeleton:
         raise ValueError("仅允许单条语句（检测到多余的分号）")
-    lowered = cleaned.lower()
+    lowered = skeleton
     if not (lowered.startswith("select") or lowered.startswith("with")):
         raise ValueError("仅允许 SELECT/WITH 查询")
     for kw in _FORBIDDEN:
-        # 粗粒度词边界检查，挡掉注释/CTE 名里夹带写操作的情况
-        if f" {kw} " in f" {lowered} " or lowered.startswith(kw):
+        if re.search(rf"\b{kw}\b", skeleton):
             raise ValueError(f"禁止的 SQL 关键字: {kw.upper()}")
     return cleaned
+
+
+# C1：单元格长度上限。模块头承诺"行数与单元格长度限制"，旧实现却只截了
+# BLOB 分支 —— 一个塞了 10MB 文本的单元格会原样进上下文，行数限制形同虚设。
+CELL_MAX_CHARS = 2000
+_CELL_MARK = "…[单元格超限截断]"
+
+
+def _cap_cell(v: Any) -> Any:
+    if v is None or isinstance(v, (int, float, bool)):
+        return v
+    s = v if isinstance(v, str) else str(v)
+    if len(s) > CELL_MAX_CHARS:
+        # 标记计入上限：承诺的是"单元格最长就这么长"，不能被尾部标记撑破
+        return s[:CELL_MAX_CHARS - len(_CELL_MARK)] + _CELL_MARK
+    return s
 
 
 def _run_sync(db_path: str, sql: str, max_rows: int) -> dict[str, Any]:
@@ -47,13 +74,7 @@ def _run_sync(db_path: str, sql: str, max_rows: int) -> dict[str, Any]:
         truncated = len(rows) > max_rows
         rows = rows[:max_rows]
         cols = [d[0] for d in cur.description] if cur.description else []
-        data = [
-            {
-                c: (v if v is None or isinstance(v, (int, float, str, bool)) else str(v)[:200])
-                for c, v in zip(cols, row)
-            }
-            for row in rows
-        ]
+        data = [{c: _cap_cell(v) for c, v in zip(cols, row)} for row in rows]
         return {"columns": cols, "rows": data, "truncated": truncated, "row_count": len(data)}
     except sqlite3.OperationalError as e:
         msg = str(e).lower()

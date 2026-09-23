@@ -6,6 +6,7 @@ API 进程内即可跑通「提交→排队→并发执行→落库」全链路�
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import logging
 import time
 import uuid
@@ -57,6 +58,13 @@ class LocalTaskQueue:
         self._closing = True
         if self._worker:
             self._worker.cancel()
+            # cancel() 只是置标志，必须 await 让消费协程真正跑完取消收尾：
+            # 否则 stop() 返回时 worker 仍是 pending 态，事件循环销毁时表现为
+            # "Task was destroyed but it is pending"，重启路径（start 再赋值
+            # self._worker）还会把未收尾的旧任务永久丢在脑后。
+            with contextlib.suppress(asyncio.CancelledError):
+                await self._worker
+            self._worker = None
         pending = list(self._running.values())
         if pending:
             import asyncio as _asyncio
@@ -91,9 +99,8 @@ class LocalTaskQueue:
         恢复不沿用原 traceparent：一次 resume 是**新的触发**（人工点了恢复 /
         审批），产生新 trace 才能让"谁在何时把任务救回来"在链路里可见。
         """
-        t = asyncio.create_task(self._execute(task_id, resume=True, resume_value=resume_value))
-        self._running[task_id] = t
-        t.add_done_callback(lambda _: self._running.pop(task_id, None))
+        self._spawn(task_id,
+                    self._execute(task_id, resume=True, resume_value=resume_value))
 
     def cancel(self, task_id: str) -> bool:
         """协作式取消：置标志位，执行引擎在节点边界检查后优雅收尾。"""
@@ -103,13 +110,32 @@ class LocalTaskQueue:
             return True
         return False
 
+    def _spawn(self, task_id: str, coro) -> None:
+        """登记任务执行协程；同一任务已有活句柄时直接拒绝重复提交。
+
+        旧实现直接 `_running[task_id] = t` 覆盖，有两个后果：两个执行协程
+        并发跑同一任务（状态双写）；被覆盖的旧协程结束时，它的 done 回调会
+        把**新句柄**从 _running 弹出 —— 新任务从此不受 cancel 与停机排空覆盖。
+        """
+        old = self._running.get(task_id)
+        if old is not None and not old.done():
+            log.warning("任务已在执行中，忽略重复提交: %s", task_id)
+            coro.close()  # 协程从未被 await，显式关闭消除警告
+            self._traces.pop(task_id, None)
+            return
+        t = asyncio.create_task(coro)
+        self._running[task_id] = t
+        # 弹出前校验句柄身份：回调只应清掉**自己**那条登记，
+        # 不能误弹后续同 id 的新句柄（旧任务结束后重新提交的场景）
+        t.add_done_callback(
+            lambda fut: self._running.pop(task_id, None)
+            if self._running.get(task_id) is fut else None)
+
     async def _consume_loop(self) -> None:
         while not self._closing:
             task_id = await self.queue.get()
             obs_metrics.QUEUE_DEPTH.set(self.queue.qsize())
-            t = asyncio.create_task(self._execute(task_id))
-            self._running[task_id] = t
-            t.add_done_callback(lambda _: self._running.pop(task_id, None))
+            self._spawn(task_id, self._execute(task_id))
 
     async def _execute(self, task_id: str, resume: bool = False,
                        resume_value=None) -> None:

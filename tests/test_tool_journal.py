@@ -7,9 +7,11 @@ tool_executor **之前**（interrupt_before），那时工具根本没执行过�
 是条件选择的结果，而不是幂等保证 —— 它证明不了任何事。
 
 本文件用「节点执行中崩溃」来构造真正的危险窗口：
-  - 工具 A 正常执行完 → 流水已提交
+  - 工具 A 正常执行完 → 认领的占位已回填为结果
   - 工具 B 抛 BaseException（进程被杀）→ 节点未返回 → checkpoint 未提交
-  - 恢复后 tool_executor 必须整节点重跑：A 应命中流水被回放，B 只能重试
+    （B 名下只剩 M3 的 in-flight 占位）
+  - 恢复后 tool_executor 必须整节点重跑：A 应命中流水被回放，
+    B 的滞留占位等待超时后被接管重跑
 
 对照组（test_without_journal_...）不注入 journal，验证 A 确实会被重复执行 ——
 以此证明"去重"来自本机制，而非别处的巧合。
@@ -40,14 +42,39 @@ class SimulatedCrash(BaseException):
 
 
 class MemoryJournal:
-    """journal 的内存实现，语义对齐 Repository：首次为准、读取返回副本。"""
+    """journal 的内存实现，语义对齐 Repository（M3 起）：
+    原子认领三态、in-flight 占位对 get 不可见、首次为准、读取返回副本。"""
+
+    IN_FLIGHT = "__in_flight__"
 
     def __init__(self) -> None:
         self.rows: dict[tuple[str, str], dict] = {}
 
     async def get_tool_execution(self, task_id: str, call_id: str) -> dict | None:
         row = self.rows.get((task_id, call_id))
-        return copy.deepcopy(row) if row else None
+        if row is None or row.get("error_type") == self.IN_FLIGHT:
+            return None
+        return copy.deepcopy(row)
+
+    async def try_claim_tool_execution(self, task_id: str, call_id: str,
+                                       tool: str, arguments: dict) -> tuple[bool, dict | None]:
+        key = (task_id, call_id)
+        if key not in self.rows:
+            self.rows[key] = {"tool": tool, "arguments": copy.deepcopy(arguments),
+                              "ok": False, "result": None,
+                              "error": "执行中（占位）", "error_type": self.IN_FLIGHT}
+            return True, None
+        row = self.rows[key]
+        if row.get("error_type") == self.IN_FLIGHT:
+            return False, None
+        return False, copy.deepcopy(row)
+
+    async def complete_tool_execution(self, task_id: str, call_id: str, obs: dict) -> None:
+        key = (task_id, call_id)
+        cur = self.rows.get(key)
+        if cur is None or cur.get("error_type") == self.IN_FLIGHT:
+            self.rows[key] = copy.deepcopy(obs)
+        # 已完成行：先写为准，不覆盖（与 Repository 同语义）
 
     async def record_tool_execution(self, task_id: str, call_id: str, obs: dict) -> None:
         self.rows.setdefault((task_id, call_id), copy.deepcopy(obs))
@@ -101,8 +128,11 @@ async def _crash_then_resume(settings, registry, saver, journal, task_id):
     return await engine2.resume_task(task_id)
 
 
-async def test_replay_skips_already_executed_tool(serial_settings, registry):
+async def test_replay_skips_already_executed_tool(serial_settings, registry, monkeypatch):
     """注入 journal：已落流水的调用被回放，不再执行。"""
+    # 接管等待缩到毫秒级（真实值 5s 是给"对方真的还在执行"留的窗口）
+    monkeypatch.setattr("app.graph.nodes.CLAIM_WAIT_S", 0.2)
+    monkeypatch.setattr("app.graph.nodes.CLAIM_POLL_INTERVAL_S", 0.05)
     calls = {"a": 0, "crash": 0}
     add_spy_tools(registry, calls)
     journal = MemoryJournal()
@@ -114,9 +144,10 @@ async def test_replay_skips_already_executed_tool(serial_settings, registry):
     with pytest.raises(SimulatedCrash):
         await engine.run_task("tj-1", "崩溃任务", "react", 60000, 24)
 
-    # 崩溃时刻：A 已执行并落流水（1 次），B 已执行但未及落流水
+    # 崩溃时刻：A 已执行并回填流水（1 次）；B 认领成功、拿到执行权后在
+    # 执行中被杀 —— 留下的只有 in-flight 占位（M3：占位让"执行中死亡"可识别）
     assert calls == {"a": 1, "crash": 1}
-    assert len(journal.rows) == 1, "只应有 A 的流水（B 在落流水前就崩了）"
+    assert len(journal.rows) == 2
     recorded = next(iter(journal.rows.values()))
     assert recorded["tool"] == "spy_a" and recorded["ok"] is True
 
@@ -127,9 +158,10 @@ async def test_replay_skips_already_executed_tool(serial_settings, registry):
 
     assert final["status"] == STATUS_DONE
     assert calls["a"] == 1, "已落流水的调用不得重复执行（幂等）"
-    assert calls["crash"] == 2, "未落流水的调用本来就该重试 —— 这正是本机制的边界"
+    assert calls["crash"] == 2, "占位滞留（对方已中断）→ 接管重跑 —— 本机制的边界"
     types = [e["type"] for e in events]
     assert "tool_replay" in types, "回放应有可观测事件"
+    assert "tool_claim_takeover" in types, "接管滞留占位也必须有可观测事件"
     # 回放的结果要真的进入模型可见的工具消息，而不是空壳
     tool_msgs = [m for m in final["messages"] if m.get("role") == "tool"]
     assert any("A-OK" in m["content"] for m in tool_msgs)
@@ -147,8 +179,10 @@ async def test_without_journal_replays_are_re_executed(serial_settings, registry
     assert calls["a"] == 2, "无 journal 时应保持旧行为（重复执行），与本机制形成对照"
 
 
-async def test_repository_journal_end_to_end(tmp_path, serial_settings, registry):
+async def test_repository_journal_end_to_end(tmp_path, serial_settings, registry, monkeypatch):
     """真实存储路径：Repository 充当 journal + SQLite checkpoint，端到端去重。"""
+    monkeypatch.setattr("app.graph.nodes.CLAIM_WAIT_S", 0.2)
+    monkeypatch.setattr("app.graph.nodes.CLAIM_POLL_INTERVAL_S", 0.05)
     _, session_factory = make_engine_and_session(
         f"sqlite+aiosqlite:///{tmp_path / 'journal.db'}")
     repo = Repository(session_factory)

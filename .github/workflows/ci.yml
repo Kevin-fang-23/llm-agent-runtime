@@ -151,22 +151,27 @@ jobs:
       # 逼着改动者在删用例时同步文档。
       # 计数方式：--collect-only -q 每行一个用例、行内含 `::`；末尾汇总行不含 `::`，
       # 所以 grep -c '::' 恰好等于用例数。
-      # 口径（实测 2026-09-21 第五轮，排除 docker/postgres/celery 三个文件后）：
-      # 收集 397 = 397 passed（+21 为本机免密 + 搜索相关性收紧的回归用例，
-      # test_localhost_bypass_and_search.py）（CI runner 上 celery_path 的外部服务用例会真跑，
-      # 必须排除在离线套件之外保持确定性口径）。
+      # 口径（实测 2026-09-23 P1 批次二后，排除 docker/postgres/celery 三个文件后）：
+      # 收集 600（P0 批次一 +8：token 口径/顶层数组计划/队列生命周期/critic 步号，
+      # test_kernel_fixes_p0.py；P0 批次二 +8：SEARCH_PROVIDER fail-loud 与 httpx
+      # 共享连接池，test_web_search_fixes_p056.py；P1 批次一 +8：registry 死代码/
+      # span 签名去谎/SecretStr+Literal，test_kernel_fixes_p1b1.py；P1 批次二 +17：
+      # owned_task 依赖后 11 端点 404/跨租户/409 语义回归 + 镜像加固配置钉，
+      # test_api_fixes_p1b2.py；迁移溢出项 +3：0003 server_default 裸 SQL 行为/
+      # 0002 现场升级数据保留/元数据不变量守卫，test_migrations.py；docker 三文件里
+      # 另有 4 条在有 Docker 的机器上通过，不计入离线口径）。
       # 阈值随套件增长单调上调，绝不下调 —— 下调等于给"删用例"开口子。
       # 例外说明：379 → 375 是把 celery_path 6 条用例**移入** integration job
       # （非删除）。用例总数 411 = 390 + 21。
-      - name: 测试数门禁（离线收集数不得低于 397）
+      - name: 测试数门禁（离线收集数不得低于 600）
         run: |
           n=$(python -m pytest tests/ --collect-only -q \
             --ignore=tests/test_docker_sandbox.py \
             --ignore=tests/test_postgres_checkpoint.py \
             --ignore=tests/test_celery_path.py 2>&1 \
             | grep -c '::' || true)
-          echo "离线套件收集到 $n 个用例（阈值 397）"
-          test "$n" -ge 397 || { echo "用例数低于 397，请同步 README / CI 中的数字"; exit 1; }
+          echo "离线套件收集到 $n 个用例（阈值 600）"
+          test "$n" -ge 600 || { echo "用例数低于 600，请同步 README / CI 中的数字"; exit 1; }
 
       # 对抗性门禁：注入敌对 provider，证明套件真的封闭（不依赖 .env 的 SEARCH_PROVIDER）。
       # 曾发生过的事故：conftest 只冻结了模型层，SEARCH_PROVIDER 回落到 .env 的 bing，

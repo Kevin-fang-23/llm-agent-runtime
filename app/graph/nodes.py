@@ -6,9 +6,12 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
+import logging
 import re
 import time
+from collections.abc import Callable
 from datetime import datetime
 from typing import Any
 
@@ -17,8 +20,13 @@ from langgraph.types import interrupt
 from app.core.budget import check_budget
 from app.core.compressor import compress_messages, inject_key_outputs, needs_compression
 from app.core.errors import ToolErrorCode
-from app.core.llm import estimate_messages_tokens
-from app.core.retry import backoff_delay, is_transient_error, looks_transient, retry_delay_hint
+from app.core.llm import estimate_messages_tokens, estimate_tokens
+from app.core.retry import (
+    backoff_delay,
+    is_transient_error,
+    looks_transient,
+    retry_delay_hint,
+)
 from app.graph import prompts
 from app.graph.state import (
     ERR_FATAL,
@@ -29,28 +37,83 @@ from app.graph.state import (
     STATUS_CANCELED,
     STATUS_DONE,
     STATUS_FAILED,
+    STATUS_RUNNING,
     AgentState,
 )
 from app.observability import metrics as obs_metrics
 from app.observability import spans as obs_spans
 from app.tools.registry import ToolExecutionError, ToolValidationError
 
+log = logging.getLogger("agent.nodes")
 
-def parse_json_loose(text: str) -> dict[str, Any] | None:
-    """容错解析模型输出的 JSON（容忍代码块围栏与前后杂文本）。"""
+
+# ---------- M3：幂等流水的调用键 ----------
+# 占位在他人手里时的等待窗口：真并发（同调用双 worker）应等到对方回填；
+# 对方执行中死亡则超时后由本方接管重跑 —— 不比旧行为（无占位直接重跑）更差。
+CLAIM_WAIT_S = 5.0
+CLAIM_POLL_INTERVAL_S = 0.25
+
+
+# ---------- A2：key_outputs 注入段上限 ----------
+# key_outputs 每步拼进 system 提示且永不被压缩：不设上限时，长任务的上下文
+# 会被这段"赢不回来"的数据被动撑爆 —— 压缩机制省下的预算又被注入段吃掉。
+# dict 保持插入序，最近确认的数据价值更高，超限从最旧删除。
+KEY_OUTPUTS_MAX_ITEMS = 30
+KEY_OUTPUTS_TOKEN_BUDGET = 1500
+
+# A2：扣除固定开销后的历史段预算下限 —— 极端情况下（开销≥配置阈值）也要给
+# 最近窗口留出生存空间，否则压缩退化为"每轮都压但永远压不下去"。
+MIN_HISTORY_BUDGET_TOKENS = 512
+
+
+def _prune_key_outputs(key_outputs: dict[str, str]) -> dict[str, str]:
+    items = list(key_outputs.items())
+    if len(items) > KEY_OUTPUTS_MAX_ITEMS:
+        items = items[-KEY_OUTPUTS_MAX_ITEMS:]
+    total = sum(estimate_tokens(f"{k}: {v}") for k, v in items)
+    while items and total > KEY_OUTPUTS_TOKEN_BUDGET:
+        k, v = items.pop(0)
+        total -= estimate_tokens(f"{k}: {v}")
+    return dict(items)
+
+
+def _journal_call_key(state: AgentState, call: dict) -> str:
+    """流水幂等键 = call_id + (轮次, 工具, 原始参数) 指纹。
+
+    为什么纯 call_id 不够（M3）：部分 OpenAI 兼容端点**每一轮都复用 "call_1"**，
+    旧键会把后一轮的真实新调用误判为前一轮的回放（新结果被旧结果替换）。
+    指纹取 state.iterations + 工具名 + 模型给出的**原始**参数：checkpoint 重放
+    同一 superstep 时三者与状态完全一致，键稳定可命中；换了轮次或参数即新调用。
+    """
+    raw = json.dumps({"n": call["name"], "a": call.get("arguments", {}),
+                      "p": call.get("args_parse_error", "")},
+                     sort_keys=True, ensure_ascii=False, default=str)
+    fp = hashlib.sha1(raw.encode("utf-8")).hexdigest()[:10]
+    key = f"{call['id']}#{state.get('iterations', 0)}:{fp}"
+    if len(key) > 80:  # call_id 列宽 String(80)：超长 id 整体折叠为摘要
+        key = hashlib.sha1(key.encode("utf-8")).hexdigest()[:20]
+    return key
+
+
+def parse_json_loose(text: str) -> dict[str, Any] | list[Any] | None:
+    """容错解析模型输出的 JSON（容忍代码块围栏与前后杂文本）。
+
+    顶层对象与顶层数组都接受：小模型经常省掉外层的 `{"steps": ...}` 壳、
+    直接输出步骤数组 —— 旧实现只找 `{`，会把数组里的第一个内层对象当成
+    整个结果，其余步骤**静默丢失**（计划退化成单步还自以为规划成功）。
+    """
     text = text.strip()
     if text.startswith("```"):
         text = text.strip("`")
         if text.startswith("json"):
             text = text[4:]
-    start = text.find("{")
-    if start < 0:
-        return None
-    try:
-        obj, _ = json.JSONDecoder().raw_decode(text[start:])
-        return obj if isinstance(obj, dict) else None
-    except json.JSONDecodeError:
-        return None
+    for start in sorted(i for i in (text.find("{"), text.find("[")) if i >= 0):
+        try:
+            obj, _ = json.JSONDecoder().raw_decode(text[start:])
+        except json.JSONDecodeError:
+            continue
+        return obj if isinstance(obj, (dict, list)) else None
+    return None
 
 
 def _plan_text(plan: list[dict]) -> str:
@@ -154,9 +217,13 @@ def _safe_layers(plan: list[dict]) -> list[list[dict]]:
     layers = _plan_layers(plan)
     if layers is not None:
         return layers
-    layers = _plan_layers(_linearize_plan(plan))
+    lin = _linearize_plan(plan)
+    layers = _plan_layers(lin)
     if layers is not None:
-        return layers
+        # _linearize_plan 产出的是**拷贝**：按位置翻译回原 plan 步骤再返回。
+        # 否则 critic 在层内标 done 只改到拷贝，state 里的计划纹丝不动。
+        at = {id(c): i for i, c in enumerate(lin)}
+        return [[plan[at[id(p)]] for p in group] for group in layers]
     return [[p] for p in plan]
 
 
@@ -190,6 +257,23 @@ def _code_value(code: ToolErrorCode | str | None) -> str | None:
     return getattr(code, "value", code)
 
 
+async def _cancellable_sleep(delay_s: float, canceled: Callable[[], bool]) -> bool:
+    """可打断的退避睡眠：以 0.5s 切片轮询取消位；睡眠中收到取消返回 True。
+
+    旧实现只在 sleep **之前**检查一次取消，而 sleep 时长可能来自上游 Retry-After
+    —— "协作式取消要立刻生效"的承诺（见 _retry_transient docstring）需要一个
+    真正能在睡眠中途响应的实现。
+    """
+    remaining = max(0.0, delay_s)
+    while remaining > 0:
+        if canceled():
+            return True
+        step = min(0.5, remaining)
+        await asyncio.sleep(step)
+        remaining -= step
+    return False
+
+
 def init_state(task_id: str, goal: str, mode: str, max_tokens: int, max_steps: int,
                require_approval: bool = False) -> AgentState:
     return AgentState(
@@ -208,6 +292,7 @@ def init_state(task_id: str, goal: str, mode: str, max_tokens: int, max_steps: i
         max_tokens=max_tokens,
         downgraded=False,
         plan_defect_streak=0,
+        mode_switches=0,
         status="running",
         last_error="",
         error_kind=ERR_NONE,
@@ -252,7 +337,9 @@ class GraphNodes:
         resp = await self.engine.llm.chat(messages, model=self._model(state))
         tokens = resp.tokens_used
         parsed = parse_json_loose(resp.text)
-        steps = _parse_plan_steps((parsed or {}).get("steps"))
+        # 顶层数组 = 模型直接给出步骤列表（省掉 {"steps": ...} 壳）
+        raw_steps = parsed.get("steps") if isinstance(parsed, dict) else parsed
+        steps = _parse_plan_steps(raw_steps)
         if not steps:  # 规划失败兜底：目标本身就是一步
             steps = [{"id": "s1", "description": state["goal"],
                       "status": "pending", "result": ""}]
@@ -260,7 +347,11 @@ class GraphNodes:
         # 自适应升级（P2-DAG）：react 模式重规划成功 → 切回 plan_execute。
         # 旧实现的缺口：react 重规划产出的计划没有任何执行轨道（plan_context
         # 仅 plan_execute 注入），重规划结果只是躺进 state.plan 的死数据。
-        upgraded = is_replan and state["mode"] == "react"
+        # H6：互切要计入总开关数——过去"升级即清零 streak"让降级护栏永远攒不满，
+        # react↔plan 无限乒乓、每环至少多烧一次 planner 调用直到 max_steps 兜底。
+        switches = state.get("mode_switches", 0)
+        upgraded = (is_replan and state["mode"] == "react"
+                    and switches < self.settings.max_mode_switches)
         if is_replan:
             done = [p for p in state.get("plan", []) if p["status"] == "done"]
             # 新步骤 id 顺延编号（接续旧计划 s<数字> 的最大值）：DAG 时代 id 是
@@ -305,8 +396,52 @@ class GraphNodes:
                          "last_error": "", "error_kind": ERR_NONE}
         if upgraded:
             updates["mode"] = "plan_execute"
-            updates["plan_defect_streak"] = 0
+            updates["mode_switches"] = switches + 1
+            # H6：刻意**不清** plan_defect_streak。它是"计划路线被证明失败的次数"，
+            # 升级清零正是旧实现乒乓循环的来源；成功批次的清零在 critic 里仍然有效。
         return updates
+
+    # ---------- 决策步上下文组装 ----------
+    def _assemble_base(self, state: AgentState) -> list[dict]:
+        """组装每一步的模型上下文：system（含关键数据注入）+ 任务提示 + 执行历史。
+
+        state.messages 只存执行历史（assistant/tool），不含 system 与任务提示，
+        因此任务提示可携带最新计划进度，且压缩只作用于历史段。
+
+        ⚠️ 不要把组装好的 base 写回 state.messages：
+           base 每轮都会新增一份 system + user，若写回历史，下一轮又把它当历史拼进去，
+           上下文随步数近似 O(n²) 膨胀。实测 4 轮工具调用时第 5 次 LLM 调用收到
+           5 份 system + 5 份 user，token 从 202 涨到 5184（26 倍），
+           并连带打穿 compressor（其切片假设 system 只出现在头部）。
+
+        compressor_node 也调用它来估算"固定开销段"的实际 token 量（A2）——
+        传 messages=[] 的 state 即可拿到不含历史的那部分。
+        """
+        system = (inject_key_outputs(prompts.REACT_SYSTEM, state.get("key_outputs", {}))
+                  + _now_context())
+        plan_context = ""
+        if state.get("plan") and state["mode"] == "plan_execute":
+            layers = _safe_layers(state["plan"])
+            idx = state.get("current_step", 0)
+            if idx < len(layers):
+                # 注入当前**批**的全部待执行步骤：DAG 下同批步骤相互独立，
+                # 模型应在一次回复里并行调用（REACT_SYSTEM 准则 2 与此呼应）
+                pending = [p for p in layers[idx] if p["status"] == "pending"]
+                step_desc = "\n".join(f"- {p['description']}" for p in pending) \
+                    or "（本批步骤已全部完成）"
+                plan_context = prompts.PLAN_CONTEXT_LINE.format(
+                    plan_text=_plan_text(state["plan"]), current_step=idx + 1,
+                    total_batches=len(layers), step_desc=step_desc,
+                )
+        user = prompts.REACT_TASK.format(
+            goal=state["goal"], used_steps=state.get("steps_used", 0),
+            max_steps=state.get("max_steps", 0), plan_context=plan_context,
+        )
+        return [
+            {"role": "system", "content": system},
+            {"role": "user", "content": user},
+            *state.get("messages", []),
+        ]
 
     # ---------- ReAct 决策步 ----------
     async def react_step_node(self, state: AgentState) -> dict:
@@ -342,53 +477,21 @@ class GraphNodes:
             downgrade_once = {"downgraded": True}
             await self.engine.emit(state, "budget_downgrade", {"reason": decision.reason, "model": model})
 
-        # 组装上下文：system（含关键数据注入）+ 任务提示（每步重建，含当前计划步骤）
-        # state.messages 只存执行历史（assistant/tool），不含 system 与任务提示，
-        # 因此任务提示可携带最新计划进度，且压缩只作用于历史段。
-        #
-        # ⚠️ 不要把组装好的 base 写回 state.messages：
-        #    base 每轮都会新增一份 system + user，若写回历史，下一轮又把它当历史拼进去，
-        #    上下文随步数近似 O(n²) 膨胀。实测 4 轮工具调用时第 5 次 LLM 调用收到
-        #    5 份 system + 5 份 user，token 从 202 涨到 5184（26 倍），
-        #    并连带打穿 compressor（其切片假设 system 只出现在头部）。
-        system = (inject_key_outputs(prompts.REACT_SYSTEM, state.get("key_outputs", {}))
-                  + _now_context())
-        plan_context = ""
-        if state.get("plan") and state["mode"] == "plan_execute":
-            layers = _safe_layers(state["plan"])
-            idx = state.get("current_step", 0)
-            if idx < len(layers):
-                # 注入当前**批**的全部待执行步骤：DAG 下同批步骤相互独立，
-                # 模型应在一次回复里并行调用（REACT_SYSTEM 准则 2 与此呼应）
-                pending = [p for p in layers[idx] if p["status"] == "pending"]
-                step_desc = "\n".join(f"- {p['description']}" for p in pending) \
-                    or "（本批步骤已全部完成）"
-                plan_context = prompts.PLAN_CONTEXT_LINE.format(
-                    plan_text=_plan_text(state["plan"]), current_step=idx + 1,
-                    total_batches=len(layers), step_desc=step_desc,
-                )
-        user = prompts.REACT_TASK.format(
-            goal=state["goal"], used_steps=state["steps_used"],
-            max_steps=state["max_steps"], plan_context=plan_context,
-        )
-        history = state.get("messages", [])
-        base = [
-            {"role": "system", "content": system},
-            {"role": "user", "content": user},
-            *history,
-        ]
+        # 组装上下文：见 _assemble_base
+        base = self._assemble_base(state)
 
         resp = await self.engine.llm.chat(base, tools=self.engine.registry.to_openai_tools(), model=model)
         step_span.set_attribute("model", resp.model)
         step_span.set_attribute("tool_calls", len(resp.tool_calls))
         step_span.set_attribute("tokens", resp.tokens_used)
         # 只把本轮 assistant 决策追加进历史；system/user 每轮现构造，不入库
-        messages = [*history, self._assistant_message(resp)]
+        messages = [*state.get("messages", []), self._assistant_message(resp)]
         tokens = state["tokens_used"] + resp.tokens_used
         steps = state["steps_used"] + 1
 
         if resp.tool_calls:
-            pending = [{"id": c.id, "name": c.name, "arguments": c.arguments} for c in resp.tool_calls]
+            pending = [{"id": c.id, "name": c.name, "arguments": c.arguments,
+                        "args_parse_error": c.args_parse_error} for c in resp.tool_calls]
             await self.engine.emit(state, "llm_step", {
                 "iteration": state["iterations"] + 1, "thought": resp.text[:400],
                 "tool_calls": [{"name": c.name, "arguments": c.arguments} for c in resp.tool_calls],
@@ -409,7 +512,9 @@ class GraphNodes:
         if not calls:
             return {"pending_tool_calls": [], "last_observations": []}
         if self.engine.is_canceled(state["task_id"]):
-            return {"status": STATUS_CANCELED, "needs_final": True, "final_answer": "任务已被用户取消。"}
+            # A1：取消路径清空待执行与观测，不给下游留陈旧数据（critic 的终态守卫是第一道）
+            return {"status": STATUS_CANCELED, "needs_final": True, "final_answer": "任务已被用户取消。",
+                    "pending_tool_calls": [], "last_observations": []}
 
         sem = asyncio.Semaphore(self.settings.max_concurrent_tools)
         messages = list(state.get("messages", []))
@@ -425,26 +530,42 @@ class GraphNodes:
             name, args = call["name"], call.get("arguments", {})
             journal = self.engine.journal
             task_id = state["task_id"]
+            call_key = _journal_call_key(state, call)
             async with sem:
-                done = await journal.get_tool_execution(task_id, call["id"]) if journal else None
-                if done is not None:
-                    # 该 call_id 已执行过（进程在节点执行中被杀 → 恢复后重跑本节点）：
+                replay: dict | None = None
+                if journal is not None:
+                    # M3：原子认领替代"查后执行"。旧流程两个 worker 都能查到
+                    # "无记录"，副作用工具各跑一次；现在抢插占位行裁决归属。
+                    claimed, existing = await journal.try_claim_tool_execution(
+                        task_id, call_key, name, args)
+                    if not claimed:
+                        replay = existing
+                        if replay is None:  # 占位在他人手里：等它回填或判定滞留
+                            replay = await self._await_claim_result(journal, task_id, call_key)
+                            if replay is None:
+                                await self.engine.emit(state, "tool_claim_takeover", {
+                                    "tool": name, "call_id": call["id"],
+                                    "reason": f"占位超过 {CLAIM_WAIT_S}s 未完成，"
+                                              "判定对方已中断，接管重跑",
+                                })
+                if replay is not None:
+                    # 该调用已执行过（进程在节点执行中被杀 → 恢复后重跑本节点）：
                     # 直接回放已提交的结果，不再触碰工具本身。
                     await self.engine.emit(state, "tool_replay", {
-                        "tool": done["tool"], "call_id": call["id"],
-                        "arguments": done["arguments"], "ok": done["ok"],
+                        "tool": replay["tool"], "call_id": call["id"],
+                        "arguments": replay["arguments"], "ok": replay["ok"],
                         "reason": "checkpoint 重跑：命中工具执行流水，跳过重复执行",
                     })
-                    obs = done
+                    obs = replay
                 else:
                     obs, attempts, repair_tokens = await self._execute_call(
                         state, call, name, args)
                     tokens += repair_tokens
                     selfheal_used += attempts
                     if journal is not None:
-                        # 先落流水再返回：这样「工具已完成、checkpoint 未提交」的崩溃窗口
+                        # 回填认领到的占位：这样「工具已完成、checkpoint 未提交」的崩溃窗口
                         # 也能在恢复时被拦住。
-                        await journal.record_tool_execution(task_id, call["id"], obs)
+                        await journal.complete_tool_execution(task_id, call_key, obs)
 
                 # 统一后处理（执行与回放两条路径共用，保证 key_outputs / 预算上卷一致）
                 if obs["ok"]:
@@ -460,7 +581,27 @@ class GraphNodes:
                         tokens += int(extra)
                 return obs
 
-        results = await asyncio.gather(*(run_one(c) for c in calls))
+        # M3：return_exceptions 保证"一错不拖全军"。旧实现首个异常直接抛出，
+        # 其余协程被 gather 弃管成孤儿（副作用照发生、结果无人收），且本批
+        # tool_calls 缺 tool 消息配对 —— 下一次模型调用会被端点判 400。
+        raw_results = await asyncio.gather(*(run_one(c) for c in calls),
+                                           return_exceptions=True)
+        # 非 Exception 的 BaseException（SimulatedCrash 型"进程死亡"、取消）：
+        # 保持节点整体失败的旧语义，原样上抛
+        for res in raw_results:
+            if isinstance(res, BaseException) and not isinstance(res, Exception):
+                raise res
+        results: list[dict] = []
+        for call, res in zip(calls, raw_results):
+            if isinstance(res, Exception):
+                log.warning("工具执行协程未捕获异常 tool=%s call_id=%s",
+                            call["name"], call["id"], exc_info=res)
+                results.append({"ok": False, "tool": call["name"],
+                                "arguments": call.get("arguments", {}),
+                                "error": f"执行协程内部异常: {res}",
+                                "error_type": "runtime", "error_code": None})
+            else:
+                results.append(res)
         for call, obs in zip(calls, results):
             observations.append(obs)
             # 失败时把结构化错误码一并交给模型：模型因此能区分"重试可能有用"与"改策略"
@@ -494,10 +635,32 @@ class GraphNodes:
             obs_metrics.TOOL_CALLS.inc(
                 {"tool": obs["tool"], "outcome": "ok" if obs["ok"] else "error"})
 
+        pruned = _prune_key_outputs(key_outputs)
+        if len(pruned) < len(key_outputs):
+            # 丢弃是静默的上下文保护，但必须留痕：排障时"模型为什么看不到某条关键数据"
+            # 只有从这条日志才能回答
+            log.info("key_outputs 超限裁剪：%d → %d（丢弃最旧：%s）", len(key_outputs),
+                     len(pruned),
+                     ", ".join(k for k in key_outputs if k not in pruned)[:200])
         return {"messages": messages, "pending_tool_calls": [], "last_observations": observations,
-                "key_outputs": key_outputs,
+                "key_outputs": pruned,
                 "selfheal_total": state.get("selfheal_total", 0) + selfheal_used,
                 "tokens_used": tokens}
+
+    async def _await_claim_result(self, journal, task_id: str, call_key: str) -> dict | None:
+        """撞上他人 in-flight 占位时的等待：给占位者留出回填窗口（M3）。
+
+        两种现实形态：对方**真在执行**（并发重复提交）→ 等到回填直接回放，
+        避免双跑副作用；对方**执行中死亡**（占位滞留）→ 超时返回 None，
+        由调用方接管重跑。接管不劣于旧行为：旧实现根本没有占位，一律直接重跑。
+        """
+        deadline = time.monotonic() + CLAIM_WAIT_S
+        while time.monotonic() < deadline:
+            await asyncio.sleep(CLAIM_POLL_INTERVAL_S)
+            done = await journal.get_tool_execution(task_id, call_key)
+            if done is not None:
+                return done
+        return None
 
     async def _execute_call(self, state: AgentState, call: dict, name: str,
                             args: dict) -> tuple[dict, int, int]:
@@ -523,10 +686,18 @@ class GraphNodes:
         with self.engine.open_span(state["task_id"], obs_spans.KIND_TOOL, name,
                                    call_id=call["id"]) as tool_span:
             try:
+                if call.get("args_parse_error"):
+                    # 模型给出的 arguments 不是合法 JSON（截断/围栏，小模型最常见失败形态）。
+                    # 折叠成校验错进入自愈循环，而不是在解析层抛异常打死整个任务——
+                    # 整套"参数自愈 + 结构化错误码"契约正是为这种输入设计的。
+                    raise ToolValidationError(call["args_parse_error"])
                 result = await self.engine.registry.execute(name, args)
             except ToolValidationError as e:
                 healed = False
                 last_err = str(e)
+                # 修复后真执行时抛出的运行错（ToolExecutionError）：参数问题已结束，
+                # 后续归类必须交给运行层，不能再冒充 validation/INVALID_ARGS
+                runtime_exc: ToolExecutionError | None = None
                 while attempts < self.settings.max_selfheal_retries:
                     attempts += 1
                     obs_metrics.SELFHEAL_TOTAL.inc({"tool": name})
@@ -551,8 +722,25 @@ class GraphNodes:
                         last_err = str(e2)
                         continue
                     except ToolExecutionError as e2:
+                        runtime_exc = e2
                         last_err = f"运行错误: {e2}"
                         break
+                if runtime_exc is not None and not healed:
+                    # 与首错同一条瞬时重试契约：retryable 码（timeout/429/5xx）获得
+                    # 原样退避重试机会；fatal 码（permission/auth）绝不进重试也绝不
+                    # 被降级成 plan_defect——否则 critic 会拿它们去重规划烧 token
+                    result, last_err, err_code = await self._retry_transient(
+                        state, call, name, args, runtime_exc)
+                    if result is None:
+                        tool_span.set_status("error")
+                        tool_span.set_attribute("error_type", "runtime")
+                        tool_span.set_attribute("error_code", str(err_code or ""))
+                        tool_span.set_attribute("selfheal_attempts", attempts)
+                        return ({"ok": False, "tool": name, "arguments": args,
+                                 "error": last_err, "error_type": "runtime",
+                                 "error_code": _code_value(err_code)},
+                                attempts, repair_tokens_used)
+                    healed = True  # 重试成功：result 已就绪，落到下方成功出口
                 if not healed:
                     tool_span.set_status("error")
                     tool_span.set_attribute("error_type", "validation")
@@ -617,10 +805,13 @@ class GraphNodes:
             if self.engine.is_canceled(state["task_id"]):
                 return (None, f"{last_exc}（任务已取消，不再重试）",
                         getattr(last_exc, "code", None))
-            # 上游给了 Retry-After 就听它的，否则退回指数退避
+            # 上游给了 Retry-After 就听它的，否则退回指数退避。
+            # H4：hint 同样受 retry_max_delay_s 封顶——上游回 Retry-After: 86400
+            # 不能让本协程睡一天（占着工具信号量，任务还迟迟落不了 checkpoint）
             hint = retry_delay_hint(last_exc)
-            delay = hint if hint is not None else backoff_delay(
-                attempt, self.settings.retry_base_delay_s, self.settings.retry_max_delay_s)
+            delay = (min(hint, self.settings.retry_max_delay_s) if hint is not None
+                     else backoff_delay(attempt, self.settings.retry_base_delay_s,
+                                        self.settings.retry_max_delay_s))
             attempts_made = attempt
             await self.engine.emit(state, "tool_retry_scheduled", {
                 "tool": name, "call_id": call["id"], "attempt": attempt,
@@ -629,7 +820,10 @@ class GraphNodes:
                 "error_code": _code_value(getattr(last_exc, "code", None)),
                 "error": str(last_exc)[:300],
             })
-            await asyncio.sleep(delay)
+            if await _cancellable_sleep(delay,
+                                        lambda: self.engine.is_canceled(state["task_id"])):
+                return (None, f"{last_exc}（任务已取消，不再重试）",
+                        getattr(last_exc, "code", None))
             try:
                 result = await self.engine.registry.execute(name, args)
             except ToolExecutionError as e:
@@ -665,7 +859,8 @@ class GraphNodes:
         ]
         resp = await self.engine.llm.chat(messages, model=self._model(state))
         fixed = parse_json_loose(resp.text)
-        if fixed is None:
+        # 修复结果必须是参数对象本身；顶层数组等形态直接判修复失败
+        if not isinstance(fixed, dict):
             return None, resp.tokens_used
         try:
             spec.validate(fixed)
@@ -675,13 +870,19 @@ class GraphNodes:
 
     # ---------- 批判节点：错误分类与计划推进 ----------
     async def critic_node(self, state: AgentState) -> dict:
+        # 终态不参与评审：取消/失败路径仍流经本节点时，若按上一轮的陈旧观测
+        # 判"成功"，会把**没执行过的步骤整批标 done**、计划进度失真（A1）。
+        if state.get("status") not in (STATUS_RUNNING, ""):
+            return {}
         observations = state.get("last_observations", [])
         failed = [o for o in observations if not o["ok"]]
 
         if not failed:
             plan = [dict(p) for p in state.get("plan", [])]
             idx = state.get("current_step", 0)
-            if plan and state["mode"] == "plan_execute":
+            # observations 为空 = 本轮根本没有工具被执行（空批次直通），
+            # 批次未推进，更不能拿"零失败"当"整批成功"（A1）
+            if plan and state["mode"] == "plan_execute" and observations:
                 # 整批推进（P2-DAG）：当前批里的全部 pending 步骤一并标 done。
                 # 一批可能含多个并行步骤（diamond 形态），线性计划时只有一步。
                 layers = _safe_layers(plan)
@@ -689,14 +890,21 @@ class GraphNodes:
                     summaries = "; ".join(
                         o["result"].get("summary", "")[:200] for o in observations if o["ok"]
                     )[:400]
+                    # 位置一次建表：plan.index(p) 既 O(n²)，又按**相等**匹配 ——
+                    # 两个字段全同的步骤（replan 撞描述很常见）会被定位到前者，
+                    # step_done 报出的步号是错的。层元素必为 plan 本体引用
+                    # （_safe_layers 保证），按 id 引用映射才唯一。
+                    positions = {id(q): i for i, q in enumerate(plan)}
+                    pending_left = sum(1 for q in plan if q["status"] == "pending")
                     for p in layers[idx]:
                         if p["status"] != "pending":
                             continue  # replan 后同批可能混有已完成步骤
                         p["status"] = "done"
                         p["result"] = summaries
+                        pending_left -= 1
                         await self.engine.emit(state, "step_done", {
-                            "step": plan.index(p) + 1, "description": p["description"],
-                            "remaining": sum(1 for q in plan if q["status"] == "pending"),
+                            "step": positions[id(p)] + 1, "description": p["description"],
+                            "remaining": pending_left,
                         })
             return {"error_kind": ERR_NONE, "last_error": "", "plan": plan,
                     "current_step": idx + 1, "plan_defect_streak": 0}
@@ -726,9 +934,21 @@ class GraphNodes:
             streak = state.get("plan_defect_streak", 0) + 1
             threshold = self.settings.adaptive_downgrade_after_replans
             if state["mode"] == "plan_execute" and 0 < threshold <= streak:
+                switches = state.get("mode_switches", 0) + 1
+                if switches > self.settings.max_mode_switches:
+                    # H6 乒乓止损：切换次数已用尽，两条执行轨道都被反复证伪，
+                    # 继续降级/升级只是换方向烧 token——直接判 failed 收尾
+                    await self.engine.emit(state, "mode_thrashing_stopped", {
+                        "mode_switches": switches - 1,
+                        "limit": self.settings.max_mode_switches,
+                        "consecutive_defects": streak, "error": errors[:200],
+                    })
+                    updates.update({"status": STATUS_FAILED, "needs_final": True})
+                    return updates
                 await self.engine.emit(state, "mode_downgraded", {
                     "from": "plan_execute", "to": "react",
                     "consecutive_defects": streak, "error": errors[:200],
+                    "mode_switches": switches,
                 })
                 # error_kind 改记 retryable：route_after_critic 因此走
                 # compressor → react_step 继续执行，不再回 planner 重规划
@@ -737,6 +957,7 @@ class GraphNodes:
                     "plan": [p for p in state.get("plan", []) if p["status"] == "done"],
                     "current_step": 0,
                     "plan_defect_streak": 0,
+                    "mode_switches": switches,
                     "error_kind": ERR_RETRYABLE,
                 })
             else:
@@ -772,17 +993,35 @@ class GraphNodes:
     # ---------- 上下文压缩 ----------
     async def compressor_node(self, state: AgentState) -> dict:
         messages = state.get("messages", [])
-        threshold = self.settings.compress_threshold_tokens
+        # A2：阈值作用于「模型实际会收到的上下文」，而不是只看历史段。每一步还会注入
+        # system（含 key_outputs）+ 任务提示，这部分可达上千 token —— 只按配置阈值
+        # 压历史段，触发会系统性偏晚，真实 prompt 在压缩生效前就可能超出模型窗口。
+        # 做法：先扣掉固定开销段，剩下的才是历史段允许占用的预算。
+        overhead = estimate_messages_tokens(
+            self._assemble_base({**state, "messages": []}))
+        threshold = max(self.settings.compress_threshold_tokens - overhead,
+                        MIN_HISTORY_BUDGET_TOKENS)
         if not needs_compression(messages, threshold):
             return {}
-        compressed, summary = await compress_messages(self.engine.llm, messages, threshold)
+        compressed, summary, summary_tokens = await compress_messages(
+            self.engine.llm, messages, threshold, model=self._model(state))
+        if compressed is messages:
+            # 历史短于保留窗口（中段为空，无从摘要）：原样返回时不发假事件，
+            # 否则轨迹里会出现"压缩发生了但什么也没变"的误导记录
+            return {}
         await self.engine.emit(state, "context_compressed", {
             "tokens_before": estimate_messages_tokens(messages),
             "tokens_after": estimate_messages_tokens(compressed),
+            "fixed_overhead_tokens": overhead,
+            "effective_history_threshold": threshold,
             "summary": summary[:300],
+            "llm_tokens": summary_tokens,
             "key_outputs_retained": sorted(state.get("key_outputs", {}).keys()),
         })
-        return {"messages": compressed}
+        # H5：摘要是真实出网的 LLM 调用，token 必须上卷进 tokens_used——
+        # 漏记会让预算与 L4 日配额在长轨迹上系统性低报（每压一次漏一次）
+        return {"messages": compressed,
+                "tokens_used": state["tokens_used"] + summary_tokens}
 
     # ---------- 收尾 ----------
     async def finisher_node(self, state: AgentState) -> dict:
@@ -791,7 +1030,10 @@ class GraphNodes:
 
         if status == STATUS_CANCELED:
             await self.engine.emit(state, "task_canceled", {})
-            return {"status": STATUS_CANCELED}
+            # A3：取消/审批拒绝统一在此收尾。final_answer 已由上游节点给出时原样保留
+            # （用户取消、审批拒绝各有专属文案），兜底防「canceled 但答案为空」。
+            return {"status": STATUS_CANCELED,
+                    "final_answer": state.get("final_answer") or "任务已被取消。"}
 
         if status == STATUS_FAILED:
             await self.engine.emit(state, "task_failed", {"error": state.get("last_error", "")[:300]})
@@ -809,6 +1051,7 @@ class GraphNodes:
             return {"final_answer": body}
 
         # 正常收尾：react 模式模型已给出最终稿则直接采用；否则/或 plan 模式做汇总
+        tokens_total = state["tokens_used"]
         if state.get("needs_final") and state.get("final_answer") and state["mode"] != "plan_execute":
             answer = state["final_answer"]
         else:
@@ -827,13 +1070,18 @@ class GraphNodes:
             ]
             resp = await self.engine.llm.chat(messages, model=self._model(state))
             answer = resp.text
+            # 汇总调用是任务的**最后一次 LLM 消耗**，必须上卷进 tokens_used：
+            # 它是 L4 租户配额与成本统计（repository.tenant_token_usage 聚合
+            # tasks.tokens_used）的事实来源，漏记会让成本系统性低报。
+            # 事件流的 "tokens" 只是展示用增量，不参与配额判定。
+            tokens_total += resp.tokens_used
             await self.engine.emit(state, "tokens", {"delta": resp.tokens_used})
         await self.engine.emit(state, "task_done", {"degraded": False, "answer_preview": answer[:200]})
-        return {"final_answer": answer, "status": STATUS_DONE}
+        return {"final_answer": answer, "status": STATUS_DONE, "tokens_used": tokens_total}
 
     # ---------- 步后路由 ----------
     async def route_after_step(self, state: AgentState) -> str:
-        if state.get("status") not in ("running", ""):
+        if state.get("status") not in (STATUS_RUNNING, ""):
             return "finisher"
         if state.get("needs_final"):
             return "finisher"
@@ -866,18 +1114,27 @@ class GraphNodes:
             await self.engine.emit(state, "approval_granted", {"decision": True})
             return {"approval_pending": False}
         await self.engine.emit(state, "approval_rejected", {"decision": False})
+        # A3：拒绝也走 finisher 统一收尾（旧实现直连 END：任务行没有 final_answer、
+        # 不发 task_canceled 事件、pending 工具清单留在 checkpoint 里）。
+        # final_answer 兜底文案在此给出，finisher 的 canceled 分支负责发事件与落状态。
         return {"approval_pending": False, "status": STATUS_CANCELED,
-                "last_error": "人工审批拒绝"}
+                "last_error": "人工审批拒绝", "pending_tool_calls": [],
+                "final_answer": "人工审批拒绝，任务已被人工终止。"}
 
     def route_after_gate(self, state: AgentState) -> str:
-        if state.get("status") == STATUS_CANCELED:
-            return "end"
+        if state.get("status") not in (STATUS_RUNNING, ""):
+            # A3：拒绝/取消 → finisher 收尾，而非直连 END
+            return "finisher"
         return "tool_executor"
 
     async def route_after_critic(self, state: AgentState) -> str:
-        kind = state.get("error_kind", ERR_NONE)
-        if state.get("status") == STATUS_FAILED:
+        # A1：任何终态都直接收尾。旧实现只拦 STATUS_FAILED —— tool_executor 在
+        # 取消路径置 STATUS_CANCELED 后，边仍是无条件进 critic，靠 critic 头部
+        # 守卫侥幸不评审；评审通过后会继续走 compressor→react，让已终止的任务
+        # 多跑一步。这里把口径统一到「status 不再 running」，与 route_after_step 对称。
+        if state.get("status") not in (STATUS_RUNNING, ""):
             return "finisher"
+        kind = state.get("error_kind", ERR_NONE)
         if kind == ERR_PLAN_DEFECT:
             return "planner"
         return "compressor"  # ok / retryable 都先过压缩再进下一个决策步

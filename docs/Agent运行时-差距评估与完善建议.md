@@ -739,7 +739,7 @@ critic 与自动重试**共用同一份**关键词表（原先是内联在 criti
 | `app/core/retry.py` | **新增**：`TRANSIENT_MARKERS` / `looks_transient` / `backoff_delay`（指数 + 封顶，不做抖动并说明理由） |
 | `app/config.py` | 三个配置：`retry_max_attempts=2` / `retry_base_delay_s=0.5` / `retry_max_delay_s=8.0`（`0` = 关闭自动重试） |
 | `app/tools/registry.py` | `ToolSpec.retry_transient: bool = False`，注释写明默认关闭的理由 |
-| `app/tools/web_search.py` · `weather.py` · `db_query.py` | 声明 `retry_transient=True` |
+| `app/tools/web_search/` · `weather.py` · `db_query.py` | 声明 `retry_transient=True` |
 | `app/graph/nodes.py` | `_retry_transient()` + `_execute_call` 接入；critic 改用共用的 `looks_transient`；`import asyncio` 提到模块级 |
 | `tests/test_retry_backoff.py` | **新增** 9 条用例（三层） |
 | `web/index.html` · `scripts/demo_cli.py` | `tool_retry_scheduled` / `_success` / `_exhausted` 三个事件的配色 |
@@ -990,7 +990,7 @@ CI 门禁由此成立，P1-3/P1-5 才动手。
 | `app/tools/registry.py` | `ToolExecutionError(message, code=, retryable=, retry_after_s=)`；**异常类型 → 错误码的集中映射**（PermissionError→PERMISSION、FileNotFoundError→NOT_FOUND、ConnectionError→NETWORK、TimeoutError→TIMEOUT、ValueError→INVALID_ARGS）；`UpstreamHTTPError` 折算成码并透传 Retry-After |
 | `app/core/retry.py` | `is_transient_error`（解析顺序：显式 retryable → 结构化 code → 文本兜底）、`retry_delay_hint`（Retry-After 优先） |
 | `app/graph/nodes.py` | 观测值 / `tool_error` 事件 / 模型可见的工具消息**都带 `error_code`**；`_classify_failure` 按码分流；重试延迟优先取 Retry-After |
-| `app/tools/web_search.py` · `weather.py` | 上游 HTTP 状态码与 httpx 超时/连接异常结构化成码 |
+| `app/tools/web_search/providers/` · `weather.py` | 上游 HTTP 状态码与 httpx 超时/连接异常结构化成码 |
 | `app/tools/subagent.py` | 显式 `retryable=False`：重试一次等于重跑整棵子执行树 |
 
 **兼容策略（不是破坏性迁移）**：`code` 默认 `None`，此时退回原文本启发式。
@@ -1191,7 +1191,7 @@ CI 会按 `requirements.txt` 安装 —— 若该包在 runner 上下载失败�
 | `app/api/security.py`（新） | 哈希 / 生成 / `TenantRegistry`（正负缓存 + 管理变更失效）/ `require_tenant` / `require_admin` / `bootstrap_auth` |
 | `app/api/ratelimit.py`（新） | `SlidingWindowLimiter`（无 await 原子性说明）+ `PerIpRateLimitMiddleware`（纯 ASGI，挂在鉴权**之前**，撞库请求同样计数）+ 日界时间辅助 |
 | `app/api/routes_admin.py`（新） | 租户创建 / 列表 / PATCH / 轮换 / 用量 / 全局指标，全部 `require_admin` 守卫 |
-| `app/api/routes_tasks.py` | 全部端点接 `require_tenant`；`create_task` 前置 `_enforce_submit_limits`（L2/L2b/L3/L4 四层，便宜的内存判定在前、DB 聚合在后，429 带 `Retry-After`） |
+| `app/api/routes_tasks.py` | 全部端点接 `require_tenant`；`create_task` 限流分两段：`_enforce_submit_rate`（L2 分钟级，前置判定）+ `_enforce_daily_quotas`（L2b/L3/L4 日级，**先落任务行占位、再判定、超限回滚删除**，堵住"判定后插入"的并发超发窗口；429 带 `Retry-After`）；SSE `/stream` 经 `ConcurrencyGate` 并发闸门（每租户/全局） |
 | `app/main.py` | lifespan 装配 registry / limiter / 引导；挂管理路由与 L1 中间件 |
 | `app/config.py` | 鉴权 5 项 + 限流 4 项 + 停机排空 1 项（见 AL） |
 | `app/worker/local_queue.py` | **stop() 先排空后取消**（AL 节，本轮最值钱的修复）；resume 任务纳入 `_running` 跟踪 |

@@ -167,3 +167,52 @@ async def test_delete_cross_tenant_is_404_but_owner_can(client):
     assert client.raw.delete("/api/tasks/del-x-1",
                              headers={"X-API-Key": other["api_key"]}).status_code == 200
     assert await repo.get_task("del-x-1") is None
+
+
+# ---------------- 恢复端点的状态守卫（双执行竞态防护） ----------------
+
+
+async def test_resume_rejects_active_statuses(client):
+    """queued/running/resuming 的任务必须拒绝恢复（409）。
+
+    否则：queued 任务会被消费循环再跑一遍、running 任务与在跑协程并发
+    —— 两者都对同一 thread_id 并发 ainvoke，checkpoint 互相踩踏、
+    终态互相覆盖（审查 H2）。"""
+    repo = client.app.state.repo
+    tid = await _tenant_id(client)
+    for status in ("queued", "running", "resuming"):
+        task_id = f"resume-guard-{status}"
+        await _seed_task(repo, tid, task_id, status)
+        r = client.post(f"/api/tasks/{task_id}/resume")
+        assert r.status_code == 409, (status, r.text)
+        assert (await repo.get_task(task_id))["status"] == status  # 状态未被误动
+
+
+async def test_resume_failed_task_still_allowed(client):
+    """failed 仍可恢复 —— 崩溃恢复的主语义不能被这次加固误伤。"""
+    repo = client.app.state.repo
+    tid = await _tenant_id(client)
+    await _seed_task(repo, tid, "resume-ok-1", "failed")
+    r = client.post("/api/tasks/resume-ok-1/resume")
+    assert r.status_code == 202
+
+
+async def test_resume_failed_without_checkpoint_stays_failed(client):
+    """无 checkpoint 的 failed 任务（启动清扫把 queued 孤儿置 failed 的产物）
+    resume 后必须保持 failed 并写明原因，而不是被静默置为 done（假完成）。"""
+    repo = client.app.state.repo
+    tid = await _tenant_id(client)
+    await _seed_task(repo, tid, "resume-orphan-1", "failed")
+    assert client.post("/api/tasks/resume-orphan-1/resume").status_code == 202
+    # 不能用 _wait_terminal：seed 的初始状态就是 failed（终态），后台执行
+    # 尚未启动时轮询会立刻返回旧的空 error。要等的是「error 写明原因」
+    # 这一新事实，而不是「到达终态」。
+    t = {}
+    deadline = time.time() + 20
+    while time.time() < deadline:
+        t = client.get("/api/tasks/resume-orphan-1").json()
+        if "无可恢复" in t.get("error", ""):
+            break
+        time.sleep(0.2)
+    assert t["status"] == "failed"    # 未被误写成 done（假完成）
+    assert "无可恢复" in t["error"]   # 原因写明，不是静默

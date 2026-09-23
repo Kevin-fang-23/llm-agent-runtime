@@ -76,9 +76,10 @@ async def main() -> None:
     if args.offline:
         llm = FakeScriptedLLM(OFFLINE_SCRIPT)
     else:
-        if not settings.llm_api_key:
+        llm_api_key = settings.llm_api_key.get_secret_value()
+        if not llm_api_key:
             sys.exit("未配置 LLM_API_KEY：请在 .env 中配置，或使用 --offline 离线演示")
-        llm = OpenAIChatLLM(settings.llm_base_url, settings.llm_api_key, settings.llm_model)
+        llm = OpenAIChatLLM(settings.llm_base_url, llm_api_key, settings.llm_model)
 
     engine = AgentEngine(settings=settings, llm=llm, registry=registry, event_sink=print_event)
     mode_desc = ("离线（假模型 + mock 搜索，不出网）" if args.offline

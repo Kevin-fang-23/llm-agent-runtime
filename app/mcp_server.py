@@ -22,6 +22,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import json
+import sys
 from pathlib import Path
 from typing import Annotated, Any
 
@@ -116,13 +117,21 @@ def build_mcp_server(settings: Settings | None = None) -> MCPServer:
         instructions="工具参数严格遵循各自的 inputSchema；执行错误会带结构化错误码。",
         version="0.1.0",
     )
+    side_effects: list[str] = []
     for name in registry.names():
         spec = registry.get(name)
+        # C6：stdio 客户端可绕过 Agent 直接触发工具。有副作用的工具在描述里
+        # 显式标注，让接入方（及其模型）在调用前就看见"这不是只读操作"。
+        description = spec.description
+        if spec.side_effect:
+            description += "【注意：该工具会产生副作用（写文件/执行代码/派生任务），请确认调用意图与凭据边界】"
+            side_effects.append(spec.name)
         server.add_tool(
             _make_handler(registry, spec),
             name=spec.name,
-            description=spec.description,
+            description=description,
         )
+    server.exposed_side_effect_tools = side_effects  # type: ignore[attr-defined]
     return server
 
 
@@ -160,6 +169,13 @@ def main() -> None:
                          ensure_ascii=False, indent=2))
         return
 
+    # C6：stdio 无鉴权 —— 能拉起该进程即可调用全部工具。启动时把暴露面里
+    # 有副作用的部分打到 stderr（stdout 是协议通道，绝不能污染）。
+    print(
+        "[warning] MCP stdio 服务端无鉴权：任何能启动本进程的客户端都可调用下列有副作用工具: "
+        + ", ".join(getattr(server, "exposed_side_effect_tools", []) or ["无"])
+        + "；工作区/数据库/沙箱边界是最后防线。",
+        file=sys.stderr, flush=True)
     server.run(transport="stdio")
 
 

@@ -18,9 +18,12 @@
   文件是生成密钥的唯一持久位置 —— 密钥只在创建时可见，重启后从文件恢复。
 - **本机免密放行**（AUTH_LOCALHOST_BYPASS，默认开启）：来自回环地址的请求免密钥，
   直接落到 default 租户。一键启动脚本打开的就是 127.0.0.1，于是"双击即可用"。
-  公网/局域网来源地址不是回环地址，**仍然要求密钥** —— 这个开关不会在把演示地址
-  发给别人的那一刻把 LLM 账单敞开。判定只看 socket 对端地址，不看任何可伪造的
-  转发头（详见 _client_is_loopback 的说明）。
+  身份判定只看 socket 对端，**绝不**用可伪造的转发头去"认定"本机；
+  但转发头被用作**否决信号**（H12）：同机 ngrok/反代前置时，所有外部用户的
+  socket 对端同样是 127.0.0.1 —— 此时请求必然带代理写入的
+  X-Forwarded-For/X-Real-IP/Forwarded，一律拒绝免密（详见 _has_forwarding_headers）。
+  完全不写转发头的代理拦不住，公网部署请显式 AUTH_LOCALHOST_BYPASS=false，
+  启动日志会为此告警一次。
 """
 from __future__ import annotations
 
@@ -28,7 +31,10 @@ import hashlib
 import ipaddress
 import json
 import logging
+import os
 import secrets
+import stat
+import subprocess
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -195,14 +201,38 @@ async def require_tenant(request: Request) -> TenantContext:
     raise HTTPException(401, "缺少 API Key（X-API-Key 请求头）")
 
 
+def _has_forwarding_headers(conn: HTTPConnection) -> bool:
+    """请求是否携带代理写入的转发头（X-Forwarded-For / X-Real-IP / Forwarded）。
+
+    H12 护栏的判据。注意方向：我们**不用**这些头做身份判定（它们可伪造，
+    trusted_proxy_hops=0 时一律不读），只用它们做**否决** —— 回环来源 + 带转发头
+    = 中间有一层代理把外部用户搬到了本机地址上（ngrok/同机 nginx 都会写这些头），
+    此时免密放行等于对所有外部用户敞开。纯本机浏览器/curl 请求不会带这些头，
+    一键启动体验不受影响。
+    """
+    return any(conn.headers.get(h) for h in
+               ("X-Forwarded-For", "X-Real-IP", "Forwarded"))
+
+
 def _localhost_bypass_allowed(request: Request, settings: Settings) -> bool:
-    """本机免密是否对该请求生效。"""
+    """本机免密是否对该请求生效（H12：加前置代理护栏）。"""
     if not settings.auth_localhost_bypass:
         return False
     if getattr(request.app.state, "localhost_login_disabled", False):
         # 运维/部署脚本主动关闭（例如想强制全链路走密钥）
         return False
-    return _client_is_loopback(request, settings.trusted_proxy_hops)
+    if not _client_is_loopback(request, settings.trusted_proxy_hops):
+        return False
+    if settings.trusted_proxy_hops <= 0 and _has_forwarding_headers(request):
+        # 回环对端 + 转发头 → 几乎必然是同机反代/隧道前置（ngrok 的 socket 对端
+        # 就是 127.0.0.1，旧注释"远端代理会改变 client.host"的断言是错的）。
+        # 拒绝免密并给出可执行的恢复路径，而不是静默敞开 default 租户。
+        log.warning(
+            "回环来源请求携带代理转发头（X-Forwarded-For/X-Real-IP/Forwarded）——"
+            "疑似同机反代/隧道前置，本机免密已对其拒绝。"
+            "确属可信代理请设 TRUSTED_PROXY_HOPS=1，公网部署请设 AUTH_LOCALHOST_BYPASS=false")
+        return False
+    return True
 
 
 async def _default_tenant(request: Request) -> TenantContext:
@@ -259,15 +289,32 @@ async def require_admin(request: Request) -> None:
     """FastAPI 依赖：管理端点专用，与租户 key 完全独立。
 
     compare_digest 常量时间比较，防时序侧信道逐字节猜 key。
+
+    D2 暴破节流：L1 每 IP 限流豁免全部 GET，而 admin 端点大量是读 —— 没有这层，
+    对 admin key 的在线暴破**完全不计速**。刻意对成功请求同样计数：管理端是
+    低频人工操作（默认 10 次/分钟足够），而"只计失败"需要限流器带 peek 语义，
+    复杂度不值。窗口分钟级自愈，误伤也会很快恢复。
     """
     settings = get_settings()
     if not settings.auth_enabled:
         return
+    limiter = getattr(request.app.state, "rate_limiter", None)
+    if limiter is not None and settings.admin_auth_fail_per_min > 0:
+        client = request.client.host if request.client else "unknown"
+        ok, retry = await limiter.allow(f"admin:{client}",
+                                        settings.admin_auth_fail_per_min)
+        if not ok:
+            raise HTTPException(
+                429, f"管理端点访问过于频繁（每 IP 每分钟 {settings.admin_auth_fail_per_min} 次），"
+                     f"请 {retry}s 后重试",
+                headers={"Retry-After": str(retry)})
     provided = _admin_key_from(request)
-    expected = getattr(request.app.state, "admin_api_key", "") or settings.admin_api_key
+    expected = getattr(request.app.state, "admin_api_key", "") or settings.admin_api_key.get_secret_value()
     if not provided:
         raise HTTPException(401, "缺少管理员密钥（X-Admin-Key 请求头）")
     if not expected or not secrets.compare_digest(provided, expected):
+        log.warning("管理员密钥校验失败：来源 IP=%s",
+                    request.client.host if request.client else "unknown")
         raise HTTPException(403, "管理员密钥不正确")
 
 
@@ -282,15 +329,46 @@ def _load_credentials(path: str) -> dict:
 
 
 def _save_credentials(path: str, admin_key: str, default_key: str) -> None:
+    """写凭据文件并尽力收紧权限（D4）。
+
+    明文无法避免：服务端必须能原样比对 key。能做的是把"谁能读到文件"收窄——
+    POSIX 用 0600 并**回读校验**（umask/文件系统差异可能让 chmod 静默失效）；
+    Windows 上 chmod 只映射到只读位、**挡不住同机其他用户**，真实收紧要走
+    NTFS ACL（icacls），这里 best-effort 调用一次，失败只告警不阻塞启动。
+    """
     p = Path(path)
     p.parent.mkdir(parents=True, exist_ok=True)
     p.write_text(json.dumps({"admin_api_key": admin_key,
                              "default_tenant_key": default_key},
                             indent=2), encoding="utf-8")
     try:
-        p.chmod(0o600)  # Windows 上近似生效；POSIX 上是真实的权限收紧
+        p.chmod(0o600)
     except OSError:
-        pass
+        log.warning("凭据文件权限收紧失败（chmod）：%s", path)
+    if os.name == "nt":
+        # icacls：清掉继承 ACE 后只授当前用户 —— 失败退回"仅告警"
+        username = os.environ.get("USERNAME") or os.environ.get("USER")
+        if username:
+            try:
+                r = subprocess.run(
+                    ["icacls", str(p), "/inheritance:r", "/grant:r", f"{username}:F"],
+                    capture_output=True, timeout=10, check=False)
+                if r.returncode != 0:
+                    raise OSError(r.stderr.decode(errors="replace")[:200])
+            except Exception as exc:  # noqa: BLE001 ACL 收紧失败不致命，但必须说响
+                log.warning("Windows NTFS ACL 收紧失败（icacls）：%s —— 明文密钥文件仍可读，"
+                            "建议改用环境变量 ADMIN_API_KEY / 专用账户运行", exc)
+        else:
+            log.warning("Windows 上 chmod 对同机其他用户无效且取不到用户名："
+                        "凭据文件为明文，建议改用环境变量 ADMIN_API_KEY")
+    else:
+        try:
+            mode = stat.S_IMODE(p.stat().st_mode)
+            if mode & 0o077:
+                log.warning("凭据文件权限收紧未生效（实际 %o）：%s —— 同机其他用户可读，"
+                            "请检查文件系统/umask，或改用环境变量 ADMIN_API_KEY", mode, path)
+        except OSError:
+            pass
 
 
 async def bootstrap_auth(app, repo: Repository, settings: Settings) -> None:
@@ -310,14 +388,16 @@ async def bootstrap_auth(app, repo: Repository, settings: Settings) -> None:
     # 也让启动日志能一句话说清"现在到底谁能免密进来"。
     app.state.localhost_login_disabled = False
     if settings.auth_localhost_bypass:
-        log.info("本机免密已启用：来自回环地址（127.0.0.1 / ::1）的请求无需 API Key，"
-                 "落到 default 租户；其他来源仍要求 X-API-Key。"
-                 "需要严格模式请设 AUTH_LOCALHOST_BYPASS=false")
+        log.warning(
+            "本机免密已启用：回环地址（127.0.0.1 / ::1）请求无需 API Key，落到 default "
+            "租户。注意：同机反代/ngrok 前置时外部用户的对端地址同样是 127.0.0.1 —— "
+            "转发头护栏会拒绝带 X-Forwarded-For/X-Real-IP 头的免密，但**不写转发头的代理"
+            "拦不住**；对外暴露请设 AUTH_LOCALHOST_BYPASS=false（或只经租户密钥访问）。")
     else:
         log.info("本机免密已关闭（AUTH_LOCALHOST_BYPASS=false）：所有来源都要求 X-API-Key")
 
     creds = _load_credentials(settings.credentials_file)
-    admin_key = settings.admin_api_key or creds.get("admin_api_key") or ""
+    admin_key = settings.admin_api_key.get_secret_value() or creds.get("admin_api_key") or ""
     if not admin_key:
         admin_key = "adm-" + secrets.token_hex(16)
     app.state.admin_api_key = admin_key

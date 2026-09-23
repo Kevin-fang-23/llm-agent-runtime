@@ -1,16 +1,18 @@
 """任务 API：提交 / 查询 / 轨迹 / **SSE 推送** / 导出 / 恢复 / 取消 / 工具清单 / 指标。
 
 鉴权与多租户：所有端点经 require_tenant 解析租户身份；任务读写全部按租户过滤，
-跨租户访问表现为 404（不泄漏存在性）。限流与配额在 create_task 前置判定：
-L1 每 IP 每分钟在中间件（鉴权前），L2/L2b/L3/L4 在本文件（鉴权后、建任务前）。
+跨租户访问表现为 404（不泄漏存在性）。限流与配额：L1 每 IP 每分钟在中间件
+（鉴权前），L2 分钟级在占位前，L2b/L3/L4 日级在**占位后**（先入库再判定，
+消除并发 TOCTOU 超发，见 _enforce_daily_quotas）。
 """
 from __future__ import annotations
 
 import asyncio
 import json
 import logging
+from typing import Annotated
 
-from fastapi import APIRouter, Depends, HTTPException, Request
+from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from fastapi.responses import StreamingResponse
 
 from app.api.ratelimit import day_start_epoch, seconds_until_midnight
@@ -47,49 +49,75 @@ def _deps(request: Request):
     return request.app.state.repo, request.app.state.queue
 
 
+async def owned_task(task_id: str, request: Request,
+                     tenant: TenantContext = Depends(require_tenant)) -> dict:
+    """A12：任务归属校验的单一实现 —— 任务存在且属于当前租户，否则 404。
+
+    此前同款"get_task → None 则 404"在 10 个端点各抄一遍：语义（跨租户一律
+    404、不泄漏存在性）一旦要改就得同步改 10 处，漏一处就是租户隔离缺口。
+    做成安全依赖后路由签名即声明所需事实（返回的任务行），FastAPI 依赖缓存
+    保证同请求内 require_tenant 也只解析一次。
+    """
+    repo, _ = _deps(request)
+    task = await repo.get_task(task_id, tenant_id=tenant.id)
+    if task is None:
+        raise HTTPException(404, "任务不存在")
+    return task
+
+
 def _rejected(detail: str, retry_after: int) -> HTTPException:
     return HTTPException(429, detail, headers={"Retry-After": str(retry_after)})
 
 
-async def _enforce_submit_limits(request: Request, tenant: TenantContext,
-                                 need_tokens: int) -> None:
-    """提交前的四层判定（顺序：便宜的内存判定在前，DB 聚合在后）。"""
+async def _enforce_submit_rate(request: Request, tenant: TenantContext) -> None:
+    """L2：每租户每分钟提交数（占位前判定 —— 限流器本身是原子计数器，无 TOCTOU）。"""
     settings = get_settings()
     limiter = request.app.state.rate_limiter
-
-    # L2：每租户每分钟提交数（memory=滑动窗口 / db=固定窗口共享预算，见 ratelimit.py）
     ok, retry = await limiter.allow(f"submit:{tenant.id}", settings.tenant_submit_per_min)
     if not ok:
         raise _rejected(
             f"提交过于频繁（每分钟 {settings.tenant_submit_per_min} 个任务），请 {retry}s 后重试", retry)
 
+
+async def _enforce_daily_quotas(request: Request, tenant: TenantContext) -> None:
+    """L2b/L3/L4 日级配额（D1：必须在**任务行已插入后**调用）。
+
+    旧顺序是"先读聚合、后 insert"：并发提交在 commit 前都看不到彼此，同一窗口
+    可同时通过判定，超发幅度 ≈ 并发度。改为**先占位再判定**：聚合天然包含
+    本次（与所有并发兄弟），阈值从 `>= limit` 变 `> limit`（自己占了一格）；
+    判定不过则删行回滚。并发下最坏是"偏保守少放一个"，不会超发。
+    崩溃在"已插入未回滚"窗口的行会滞留 queued：本地队列不会执行它
+    （从未 submit），进程重启时被 fail_interrupted_tasks 清扫置 failed。
+    """
+    settings = get_settings()
     repo = request.app.state.repo
     day_start = day_start_epoch()
     until_midnight = seconds_until_midnight()
 
-    # L2b：每租户每日提交数（tasks 表实数）
+    # L2b：每租户每日提交数（tasks 表实数，含本次占位）
     if settings.tenant_daily_task_limit > 0:
         n = await repo.count_tasks_since(day_start, tenant.id)
-        if n >= settings.tenant_daily_task_limit:
+        if n > settings.tenant_daily_task_limit:
             raise _rejected(
-                f"今日提交额度已用完（{n}/{settings.tenant_daily_task_limit}），"
-                f"{until_midnight}s 后重置", until_midnight)
+                f"今日提交额度已用完（{settings.tenant_daily_task_limit}），明日零点重置",
+                until_midnight)
 
     # L3：全局每日提交数 —— 真正的资金护栏
     if settings.global_daily_task_limit > 0:
         n = await repo.count_tasks_since(day_start)
-        if n >= settings.global_daily_task_limit:
+        if n > settings.global_daily_task_limit:
             raise _rejected(
-                f"平台今日总提交额度已用完（{n}/{settings.global_daily_task_limit}），"
-                f"{until_midnight}s 后重置", until_midnight)
+                f"平台今日总提交额度已用完（{settings.global_daily_task_limit}），明日零点重置",
+                until_midnight)
 
-    # L4：每租户每日 token 配额（实耗 + 在途预占 + 本次请求的预算需求）
+    # L4：每租户每日 token 配额。占位行是 queued 状态，其 max_tokens 已计入
+    # tenant_token_usage 的"在途预占"，因此不再另加 need_tokens（否则双计）。
     if tenant.daily_token_quota > 0:
         usage = await repo.tenant_token_usage(tenant.id, day_start)
-        if usage["used"] + usage["reserved"] + need_tokens > tenant.daily_token_quota:
+        if usage["used"] + usage["reserved"] > tenant.daily_token_quota:
             raise _rejected(
-                f"今日 token 配额不足：已用 {usage['used']} + 在途预占 {usage['reserved']}"
-                f" + 本次需求 {need_tokens} > 配额 {tenant.daily_token_quota}",
+                f"今日 token 配额不足：实耗 {usage['used']} + 在途预占 {usage['reserved']}"
+                f"（含本次）> 配额 {tenant.daily_token_quota}",
                 until_midnight)
 
 
@@ -99,12 +127,9 @@ async def create_task(body: TaskCreate, request: Request,
     repo, queue = _deps(request)
     settings = get_settings()
     max_tokens = body.max_tokens or settings.default_max_tokens
-    await _enforce_submit_limits(request, tenant, max_tokens)
+    await _enforce_submit_rate(request, tenant)
     task_id = new_task_id()
-    # 入站 trace 传播（W3C Trace Context）：带上 traceparent 的调用方，其 trace_id
-    # 会被本任务的日志与事件流复用，从而在 collector 里把"调用方 → Agent 任务"
-    # 连成一条链。头非法/缺失时引擎侧会自生成，调用方无需关心。
-    traceparent = request.headers.get(TRACEPARENT_HEADER)
+    # 先占位入库（D1）：日级配额判定基于"含本次"的聚合，见 _enforce_daily_quotas
     await repo.create_task(
         task_id, body.goal, body.mode,
         max_tokens,
@@ -112,6 +137,15 @@ async def create_task(body: TaskCreate, request: Request,
         tenant_id=tenant.id,
         require_approval=body.require_approval,
     )
+    try:
+        await _enforce_daily_quotas(request, tenant)
+    except HTTPException:
+        await repo.delete_task(task_id, tenant_id=tenant.id)  # 回滚占位
+        raise
+    # 入站 trace 传播（W3C Trace Context）：带上 traceparent 的调用方，其 trace_id
+    # 会被本任务的日志与事件流复用，从而在 collector 里把"调用方 → Agent 任务"
+    # 连成一条链。头非法/缺失时引擎侧会自生成，调用方无需关心。
+    traceparent = request.headers.get(TRACEPARENT_HEADER)
     if settings.queue_mode == "celery":
         from app.worker.celery_app import run_task
 
@@ -126,19 +160,18 @@ async def create_task(body: TaskCreate, request: Request,
 
 
 @router.get("/tasks")
-async def list_tasks(request: Request, limit: int = 50,
+async def list_tasks(request: Request,
+                     limit: Annotated[int, Query(ge=1, le=200)] = 50,
                      tenant: TenantContext = Depends(require_tenant)):
+    # D3：limit 必须有上下界 —— 旧版 `?limit=-1` 在 SQLite 下（LIMIT -1 = 不限）
+    # 等于整表返回，PG 下则直接报错；上界 200 防单页拉穿内存/带宽
     repo, _ = _deps(request)
     return await repo.list_tasks(limit=limit, tenant_id=tenant.id)
 
 
 @router.get("/tasks/{task_id}")
 async def get_task(task_id: str, request: Request,
-                   tenant: TenantContext = Depends(require_tenant)):
-    repo, _ = _deps(request)
-    task = await repo.get_task(task_id, tenant_id=tenant.id)
-    if task is None:
-        raise HTTPException(404, "任务不存在")
+                   task: dict = Depends(owned_task)):
     engine = request.app.state.engine_holder.engine
     checkpoint_next = []
     if engine is not None:
@@ -152,7 +185,7 @@ async def get_task(task_id: str, request: Request,
 
 @router.get("/tasks/{task_id}/spans")
 async def get_spans(task_id: str, request: Request, kind: str = "",
-                    tenant: TenantContext = Depends(require_tenant)):
+                    _task: dict = Depends(owned_task)):
     """取该任务的 span 树（P2-6），返回**已组装好的树**而非扁平列表。
 
     为什么在服务端建树：父子关系是 span 数据的固有语义，前端算一次、后端算一次
@@ -166,8 +199,6 @@ async def get_spans(task_id: str, request: Request, kind: str = "",
     租户隔离：先校验任务归属（跨租户一律 404，不泄漏任务存在性），再查 span。
     """
     repo, _ = _deps(request)
-    if await repo.get_task(task_id, tenant_id=tenant.id) is None:
-        raise HTTPException(404, "任务不存在")
     spans = await repo.get_spans_by_task(task_id, kind=kind)
     tree = obs_spans.build_tree(spans)
     # 汇总：各 kind 的总耗时与条数，让调用方不必遍历树做基础统计
@@ -183,29 +214,26 @@ async def get_spans(task_id: str, request: Request, kind: str = "",
 
 @router.get("/tasks/{task_id}/trace")
 async def get_trace(task_id: str, request: Request,
-                    tenant: TenantContext = Depends(require_tenant)):
+                    _task: dict = Depends(owned_task)):
     repo, _ = _deps(request)
-    if await repo.get_task(task_id, tenant_id=tenant.id) is None:
-        raise HTTPException(404, "任务不存在")
     return await repo.get_events(task_id)
 
 
 @router.get("/tasks/{task_id}/events")
 async def get_events(task_id: str, request: Request, after: int = -1,
-                     tenant: TenantContext = Depends(require_tenant)):
+                     _task: dict = Depends(owned_task)):
     """增量轮询接口：前端传上次最大 seq。
 
     保留它是为了兼容不支持 SSE 的环境；前端已改用 `/stream`（SSE）。
     """
     repo, _ = _deps(request)
-    if await repo.get_task(task_id, tenant_id=tenant.id) is None:
-        raise HTTPException(404, "任务不存在")
     events = await repo.get_events(task_id, after_seq=after)
     return {"events": events, "last_seq": max((e["seq"] for e in events), default=after)}
 
 
 @router.get("/tasks/{task_id}/stream")
 async def stream_events(task_id: str, request: Request,
+                        _task: dict = Depends(owned_task),
                         tenant: TenantContext = Depends(require_tenant)):
     """SSE 推送轨迹：替代前端 1.5s 轮询，事件产生后 0.4s 内到达。
 
@@ -214,8 +242,15 @@ async def stream_events(task_id: str, request: Request,
     终端状态出现后推送 `stream_end` 并关闭连接。
     """
     repo, _ = _deps(request)
-    if await repo.get_task(task_id, tenant_id=tenant.id) is None:
-        raise HTTPException(404, "任务不存在")
+
+    # D2：L1 豁免全部读请求，而 SSE 每条都以 0.4s 轮询 DB、最长挂 300s ——
+    # 并发不设上限即可用几十条连接拖垮库连接池。占不到槽位直接 429（此时
+    # 还没开始流式响应，可以正常返回错误码）。
+    gate = request.app.state.stream_gate
+    if not gate.try_acquire(tenant.id):
+        raise HTTPException(
+            429, "实时轨迹流并发已达上限，请关闭部分页面后重试",
+            headers={"Retry-After": "5"})
 
     def _sig(t: dict | None) -> tuple:
         if not t:
@@ -227,29 +262,32 @@ async def stream_events(task_id: str, request: Request,
         last = -1
         waited = 0.0
         sig = ()
-        while True:
-            if await request.is_disconnected():
-                return
-            for e in await repo.get_events(task_id, after_seq=last):
-                last = max(last, e["seq"])
-                yield (f"event: {e['type']}\n"
-                       f"data: {json.dumps(e, ensure_ascii=False)}\n\n")
-            task = await repo.get_task(task_id)
-            # 任务快照只在"有变化"时推一次：前端据此更新状态/进度条，无需再轮询详情
-            if task and _sig(task) != sig:
-                sig = _sig(task)
-                yield (f"event: task\n"
-                       f"data: {json.dumps(task, ensure_ascii=False)}\n\n")
-            status = (task or {}).get("status", "")
-            if status in TERMINAL:
-                yield (f"event: stream_end\n"
-                       f"data: {json.dumps({'status': status}, ensure_ascii=False)}\n\n")
-                return
-            await asyncio.sleep(STREAM_POLL_S)
-            waited += STREAM_POLL_S
-            if waited >= STREAM_MAX_S:
-                yield "event: stream_end\ndata: {\"status\": \"stream_timeout\"}\n\n"
-                return
+        try:
+            while True:
+                if await request.is_disconnected():
+                    return
+                for e in await repo.get_events(task_id, after_seq=last):
+                    last = max(last, e["seq"])
+                    yield (f"event: {e['type']}\n"
+                           f"data: {json.dumps(e, ensure_ascii=False)}\n\n")
+                task = await repo.get_task(task_id)
+                # 任务快照只在"有变化"时推一次：前端据此更新状态/进度条，无需再轮询详情
+                if task and _sig(task) != sig:
+                    sig = _sig(task)
+                    yield (f"event: task\n"
+                           f"data: {json.dumps(task, ensure_ascii=False)}\n\n")
+                status = (task or {}).get("status", "")
+                if status in TERMINAL:
+                    yield (f"event: stream_end\n"
+                           f"data: {json.dumps({'status': status}, ensure_ascii=False)}\n\n")
+                    return
+                await asyncio.sleep(STREAM_POLL_S)
+                waited += STREAM_POLL_S
+                if waited >= STREAM_MAX_S:
+                    yield "event: stream_end\ndata: {\"status\": \"stream_timeout\"}\n\n"
+                    return
+        finally:
+            gate.release(tenant.id)  # 正常结束/超时/断连（GeneratorExit）都回到这里
 
     return StreamingResponse(
         gen(),
@@ -261,12 +299,9 @@ async def stream_events(task_id: str, request: Request,
 
 @router.get("/tasks/{task_id}/export")
 async def export_trace(task_id: str, request: Request, format: str = "json",
-                       tenant: TenantContext = Depends(require_tenant)):
+                       task: dict = Depends(owned_task)):
     """导出轨迹：json（结构化）或 md（便于贴进报告/复盘）。"""
     repo, _ = _deps(request)
-    task = await repo.get_task(task_id, tenant_id=tenant.id)
-    if task is None:
-        raise HTTPException(404, "任务不存在")
     events = await repo.get_events(task_id)
     if format not in ("json", "md"):
         raise HTTPException(400, "format 只支持 json / md")
@@ -308,16 +343,24 @@ async def export_trace(task_id: str, request: Request, format: str = "json",
 
 @router.post("/tasks/{task_id}/resume", status_code=202)
 async def resume_task(task_id: str, request: Request,
-                      tenant: TenantContext = Depends(require_tenant)):
+                      task: dict = Depends(owned_task)):
     """从 checkpoint 恢复任务（进程崩溃 / 中断后调用）。"""
-    repo, queue = _deps(request)
-    task = await repo.get_task(task_id, tenant_id=tenant.id)
-    if task is None:
-        raise HTTPException(404, "任务不存在")
-    if task["status"] in TERMINAL:
+    _, queue = _deps(request)
+    # failed 刻意**不**在此拒绝：崩溃/中断的任务由启动清扫置 failed（见
+    # local_queue.start 的 fail_interrupted_tasks），「从断点恢复」的主通路
+    # 正是对 failed 任务调用本端点 —— 若一并拒绝，恢复能力对真实崩溃场景
+    # 永远不可达。
+    if task["status"] in (STATUS_DONE, STATUS_CANCELED, STATUS_BUDGET_EXCEEDED):
         raise HTTPException(409, f"任务已终态（{task['status']}），无法恢复")
     if task["status"] == "waiting_approval":
         raise HTTPException(409, "任务等待人工审批，请使用 /approve 或 /reject 提供决策")
+    if task["status"] in ("queued", "running", "resuming"):
+        # 这三种状态的任务要么还在队列里等着被消费、要么正在执行 ——
+        # 对它们恢复会与正常执行并发跑同一 thread_id（checkpoint 互相
+        # 踩踏、终态互相覆盖）。队列自己会推进它们，无需恢复；
+        # 确要停止请先 /cancel。
+        raise HTTPException(
+            409, f"任务正在排队或执行中（{task['status']}），无需恢复；如需停止请先 /cancel")
     settings = get_settings()
     if settings.queue_mode == "celery":
         from app.worker.celery_app import resume_task as celery_resume
@@ -330,24 +373,18 @@ async def resume_task(task_id: str, request: Request,
 
 # ---------- HITL 人工审批（P2-2） ----------
 
-async def _require_waiting_task(task_id: str, request: Request,
-                                tenant: TenantContext) -> dict:
-    """approve/reject 共用的前置：任务存在、属于该租户、且正停在审批门上。"""
-    repo, _ = _deps(request)
-    task = await repo.get_task(task_id, tenant_id=tenant.id)
-    if task is None:
-        raise HTTPException(404, "任务不存在")
+def _require_waiting(task: dict) -> None:
+    """approve/reject 共用的前置：任务必须正停在审批门上（归属已由 owned_task 校验）。"""
     if task["status"] != "waiting_approval":
         raise HTTPException(409, f"任务不在等待审批状态（当前 {task['status']}）")
-    return task
 
 
 @router.post("/tasks/{task_id}/approve", status_code=202)
 async def approve_task(task_id: str, request: Request,
-                       tenant: TenantContext = Depends(require_tenant)):
+                       task: dict = Depends(owned_task)):
     """批准挂起中的任务：放行本轮工具执行（require_approval 任务下一轮工具前会再次挂起）。"""
-    await _require_waiting_task(task_id, request, tenant)
-    repo, queue = _deps(request)
+    _require_waiting(task)
+    _, queue = _deps(request)
     settings = get_settings()
     if settings.queue_mode == "celery":
         from app.worker.celery_app import resume_task as celery_resume
@@ -360,10 +397,10 @@ async def approve_task(task_id: str, request: Request,
 
 @router.post("/tasks/{task_id}/reject", status_code=202)
 async def reject_task(task_id: str, request: Request,
-                      tenant: TenantContext = Depends(require_tenant)):
+                      task: dict = Depends(owned_task)):
     """拒绝挂起中的任务：审批门以 Command(resume=False) 恢复后置为 canceled（可追溯）。"""
-    await _require_waiting_task(task_id, request, tenant)
-    repo, queue = _deps(request)
+    _require_waiting(task)
+    _, queue = _deps(request)
     settings = get_settings()
     if settings.queue_mode == "celery":
         from app.worker.celery_app import resume_task as celery_resume
@@ -376,11 +413,8 @@ async def reject_task(task_id: str, request: Request,
 
 @router.post("/tasks/{task_id}/cancel", status_code=202)
 async def cancel_task(task_id: str, request: Request,
-                      tenant: TenantContext = Depends(require_tenant)):
+                      _task: dict = Depends(owned_task)):
     repo, queue = _deps(request)
-    task = await repo.get_task(task_id, tenant_id=tenant.id)
-    if task is None:
-        raise HTTPException(404, "任务不存在")
     ok = queue.cancel(task_id)
     if not ok:
         await repo.update_task(task_id, status="canceled", error="任务尚未开始执行即被取消")
@@ -389,6 +423,7 @@ async def cancel_task(task_id: str, request: Request,
 
 @router.delete("/tasks/{task_id}")
 async def delete_task(task_id: str, request: Request,
+                      task: dict = Depends(owned_task),
                       tenant: TenantContext = Depends(require_tenant)):
     """删除任务及其轨迹数据（**不可恢复**）。
 
@@ -403,9 +438,6 @@ async def delete_task(task_id: str, request: Request,
     会返回 None，这里同样回 404（对外语义一致，不暴露竞态细节）。
     """
     repo, _ = _deps(request)
-    task = await repo.get_task(task_id, tenant_id=tenant.id)
-    if task is None:
-        raise HTTPException(404, "任务不存在")
     if task["status"] not in DELETABLE:
         raise HTTPException(409, f"任务正在执行（{task['status']}），请先取消再删除")
     deleted = await repo.delete_task(task_id, tenant_id=tenant.id)

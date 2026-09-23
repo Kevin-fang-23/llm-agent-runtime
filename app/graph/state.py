@@ -46,6 +46,7 @@ class AgentState(TypedDict, total=False):
     plan: list[PlanStep]         # plan_execute 模式的计划（DAG：步骤可声明 deps）
     current_step: int            # 当前执行的**批次号**（Kahn 分层下标；线性计划 = 旧步骤下标）
     plan_defect_streak: int      # 连续 plan_defect 次数（自适应降级的判定依据）
+    mode_switches: int           # react↔plan_execute 累计互切次数（H6 乒乓止损依据）
     key_outputs: dict[str, str]  # 不可压缩的关键工具输出
 
     iterations: int              # 已执行的 LLM 决策步数

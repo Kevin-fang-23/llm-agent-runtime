@@ -8,7 +8,9 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import time
+from pathlib import Path
 from typing import Any
 
 from sqlalchemy import delete, func, select, text
@@ -17,6 +19,13 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from app.config import PROJECT_ROOT
 from app.storage.models import Event, RateWindow, Span, Task, Tenant, ToolExecution
+
+log = logging.getLogger("agent.storage")
+
+# M3：tool_executions 的 in-flight 占位标记（存 error_type 列，零 schema 变更）。
+# 认领 = 抢插一条带此标记的占位行，靠 (task_id, call_id) 唯一约束裁决归属；
+# 完成时由 complete_tool_execution 回填真实结果并清除标记。
+TOOL_CLAIM_IN_FLIGHT = "__in_flight__"
 
 # 未进入终态的任务（其 max_tokens 视为已预占的配额）
 _ACTIVE_STATUSES = ("queued", "running", "resuming")
@@ -45,7 +54,74 @@ class Repository:
     def __init__(self, session_factory: async_sessionmaker[AsyncSession]):
         self.session_factory = session_factory
 
+    # ---------- B4：跨进程迁移租约 ----------
+    # 迁移（alembic upgrade / create_all 补列）不是并发安全的：compose 形态下
+    # api 与 worker 两个进程几乎同时启动，各自跑一遍 _detect_and_fix，
+    # 双双按"旧库/全新库"决策 → 同一 DDL 执行两遍，后到的那个撞上
+    # "table already exists" 直接崩启动。文件锁救不了容器间互斥（/tmp 各一份），
+    # 所以把租约写进**业务库自己**的一行：所有能连上同一 DB 的进程天然共享。
+    # 语义是**建议锁 + 超时接管**：持有者崩溃不会永久卡死后来者（超过
+    # LEASE_STALE_S 的行被抢走），代价是它不防不懂协议的第三方写入。
+    LEASE_STALE_S = 120.0
+    LEASE_WAIT_S = 120.0
+    LEASE_POLL_S = 0.5
+
     async def create_tables(self) -> None:
+        """迁移入口：抢到跨进程租约后再执行（B4），对调用方仍是零配置启动。"""
+        owner = await self._acquire_migration_lease()
+        try:
+            await self._migrate()
+        finally:
+            await self._release_migration_lease(owner)
+
+    async def _acquire_migration_lease(self) -> str:
+        import uuid
+
+        owner = uuid.uuid4().hex[:16]
+        deadline = time.monotonic() + self.LEASE_WAIT_S
+        while True:
+            try:
+                async with self.session_factory() as session:
+                    await session.execute(text(
+                        "CREATE TABLE IF NOT EXISTS schema_migration_lease ("
+                        "id INTEGER PRIMARY KEY, owner TEXT NOT NULL, "
+                        "acquired_at DOUBLE PRECISION NOT NULL)"))
+                    await session.commit()
+                    res = await session.execute(text(
+                        "INSERT INTO schema_migration_lease (id, owner, acquired_at) "
+                        "VALUES (1, :o, :t) ON CONFLICT (id) DO NOTHING"),
+                        {"o": owner, "t": time.time()})
+                    await session.commit()
+                    if res.rowcount == 1:
+                        return owner
+                    # 租约在他人手里：滞留超时则原子夺回（条件 DELETE 保证
+                    # 只有一个夺位者成功，其余撞回下一轮 INSERT 冲突）
+                    res = await session.execute(text(
+                        "DELETE FROM schema_migration_lease "
+                        "WHERE id = 1 AND acquired_at < :cutoff"),
+                        {"cutoff": time.time() - self.LEASE_STALE_S})
+                    await session.commit()
+            except Exception as e:  # noqa: BLE001 单轮失败（建表竞态等）下一轮重试
+                log.debug("迁移租约轮询异常（重试）: %s", e)
+            if time.monotonic() > deadline:
+                raise RuntimeError(
+                    "迁移租约等待超时：另一进程的数据库迁移超过 "
+                    f"{self.LEASE_WAIT_S:.0f}s 未结束，放弃启动以免并发 DDL。"
+                    "若确认无迁移在跑，可手工 DELETE schema_migration_lease 行后重启。")
+            await asyncio.sleep(self.LEASE_POLL_S)
+
+    async def _release_migration_lease(self, owner: str) -> None:
+        # 只删自己那行：租约若已被超时接管方夺走，这里必须无操作
+        try:
+            async with self.session_factory() as session:
+                await session.execute(text(
+                    "DELETE FROM schema_migration_lease WHERE id = 1 AND owner = :o"),
+                    {"o": owner})
+                await session.commit()
+        except Exception:  # noqa: BLE001 释放失败只让租约多滞留到超时，不掩迁移结果
+            log.warning("迁移租约释放失败，将由超时接管机制回收", exc_info=True)
+
+    async def _migrate(self) -> None:
         """建表三路径（P2-Alembic），对调用方完全透明（零配置启动不变）：
 
         - **全新库**（无任何表）：``alembic upgrade head`` 从 baseline 迁移建
@@ -190,6 +266,33 @@ class Repository:
             await session.commit()
             return len(rows)
 
+    async def fail_stale_active_tasks(self, max_age_s: float, error: str,
+                                      statuses: tuple[str, ...] = ("running", "resuming")) -> int:
+        """H8：定期清扫**陈旧**的非终态任务（celery 模式孤儿回收，不依赖重启）。
+
+        worker 被 SIGKILL / OOM / 宿主重启时，它跑着的 running 行没人写终态：
+        local 模式有启动清扫兜底（fail_interrupted_tasks），celery 模式却没有
+        —— worker 随时可能重启，启动清扫既不能同步执行（拖慢 broker 拉取）也
+        不安全（多 worker 时彼此的在途任务是正常的）。这里按 updated_at 判旧：
+        调用方给的最大年龄必须**大于任务硬时限**（见 celery_app 的推导），
+        活着的任务不可能比时限还老，误杀为零。
+
+        queued **不在默认清扫范围**：celery 模式下 queued 行可能还在存活 broker
+        里排队（prefetch 积压），本进程无权替它判死 —— 与启动清扫同一纪律。
+        """
+        cutoff = time.time() - max_age_s
+        async with self.session_factory() as session:
+            rows = (await session.execute(
+                select(Task).where(Task.status.in_(statuses),
+                                   Task.updated_at < cutoff))).scalars().all()
+            now = time.time()
+            for t in rows:
+                t.status = "failed"
+                t.error = error
+                t.updated_at = now
+            await session.commit()
+            return len(rows)
+
     async def get_task(self, task_id: str, tenant_id: str | None = None) -> dict | None:
         async with self.session_factory() as session:
             if tenant_id is None:
@@ -237,7 +340,48 @@ class Repository:
             for model in (Event, Span, ToolExecution):
                 await session.execute(delete(model).where(model.task_id == task_id))
             await session.commit()
-            return snapshot
+        # B5：langgraph 的 thread 状态在 checkpoint 库里，删任务行不会带走它 ——
+        # 残留的 checkpoint 让同 id 重提"复活"旧轨迹（thread_id 相同），也永远占盘。
+        # 尽力而为：业务数据已删干净，checkpoint 清理失败只告警，不把 delete 翻成失败。
+        await self._delete_thread_checkpoints(task_id)
+        return snapshot
+
+    async def _delete_thread_checkpoints(self, task_id: str) -> None:
+        """按 thread_id 清除 checkpoint 线程态（B5）。表名以安装的 langgraph saver 为准：
+        SQLite 为 checkpoints/writes，Postgres 为 checkpoints/checkpoint_blobs/checkpoint_writes。
+        表不存在（从未 setup 过 saver）视为"本就没有可删的"，静默跳过。"""
+        engine = self.session_factory.kw.get("bind")
+        url = str(engine.url) if engine is not None else ""
+        try:
+            if url.startswith("postgresql"):
+                tables = ("checkpoint_writes", "checkpoint_blobs", "checkpoints")
+                async with self.session_factory() as session:
+                    for tbl in tables:
+                        try:
+                            await session.execute(
+                                text(f"DELETE FROM {tbl} WHERE thread_id = :tid"),
+                                {"tid": task_id})
+                        except Exception:  # noqa: BLE001 单表缺失不拦其余表
+                            await session.rollback()
+                    await session.commit()
+            else:
+                from app.config import get_settings
+
+                path = get_settings().checkpoint_sqlite_path
+                if not Path(path).exists():
+                    return
+                import aiosqlite
+
+                async with aiosqlite.connect(path) as conn:
+                    for tbl in ("writes", "checkpoints"):
+                        try:
+                            await conn.execute(
+                                f"DELETE FROM {tbl} WHERE thread_id = ?", (task_id,))
+                        except Exception:  # noqa: BLE001 表不存在 = 无线程态可删
+                            pass
+                    await conn.commit()
+        except Exception:  # noqa: BLE001 见 delete_task 的尽力而为注释
+            log.warning("checkpoint 线程态清理失败 task=%s", task_id, exc_info=True)
 
     async def count_tasks_since(self, since: float,
                                 tenant_id: str | None = None) -> int:
@@ -331,6 +475,20 @@ class Repository:
                 .order_by(Event.seq))).scalars().all()
             return [_event_dict(e) for e in rows]
 
+    async def get_max_event_seq(self, task_id: str) -> int:
+        """H11：任务已落库事件的最大 seq（无事件时 0）。
+
+        引擎在 run/resume 入口用它给该任务的 seq 计数器播种：seq 曾是进程级
+        计数器，崩溃恢复换引擎后从 1 重来 —— 与旧事件撞号且比 after_seq 订阅
+        的水位小，恢复后的新事件在增量拉取里**永久隐身**。续号从源头消除撞号，
+        events 表的 (task_id, seq) 唯一约束负责暴露任何再犯。
+        """
+        async with self.session_factory() as session:
+            val = (await session.execute(
+                select(func.max(Event.seq)).where(Event.task_id == task_id)
+            )).scalar()
+            return int(val or 0)
+
     # ---------- Span 树（P2-6） ----------
     async def record_span(self, span: dict) -> None:
         """写入一个 span。`attributes` 序列化为 JSON 字符串（形态不固定，见 models.Span）。"""
@@ -415,17 +573,101 @@ class Repository:
 
     # ---------- 工具执行流水（幂等去重） ----------
     async def get_tool_execution(self, task_id: str, call_id: str) -> dict | None:
-        """查已完成调用。命中即表示该 call_id 不应再执行（返回可回放的观测值）。"""
+        """查已完成调用。命中即表示该 call_id 不应再执行（返回可回放的观测值）。
+
+        M3：in-flight 占位行**不算命中**（返回 None）—— 它表示"有人在执行"，
+        而不是"有结果可回放"；调用方据 try_claim/轮询的三态区分这两种情况。
+        """
+        async with self.session_factory() as session:
+            row = (await session.execute(
+                select(ToolExecution).where(
+                    ToolExecution.task_id == task_id,
+                    ToolExecution.call_id == call_id,
+                    ToolExecution.error_type != TOOL_CLAIM_IN_FLIGHT,
+                ))).scalars().first()
+            return _tool_exec_dict(row) if row else None
+
+    async def try_claim_tool_execution(self, task_id: str, call_id: str,
+                                       tool: str, arguments: dict) -> tuple[bool, dict | None]:
+        """M3 原子认领：INSERT 占位行，让唯一约束替我们裁决归属（无查后写竞态）。
+
+        三态语义见 `app/graph/engine.py::ToolJournal.try_claim_tool_execution`。
+        旧流程"先查后执行"在两个 worker 间有窗口：双方都查到无记录 → 各跑一次
+        副作用工具。认领把"检查"和"占坑"合并为一次原子写入。
+        """
+        record = ToolExecution(
+            task_id=task_id, call_id=call_id, tool=str(tool),
+            arguments=json.dumps(arguments or {}, ensure_ascii=False, default=str),
+            ok=False, result="", error="执行中（占位）",
+            error_type=TOOL_CLAIM_IN_FLIGHT,
+        )
+        async with self.session_factory() as session:
+            session.add(record)
+            try:
+                await session.commit()
+                return True, None
+            except IntegrityError:
+                await session.rollback()
+                row = (await session.execute(
+                    select(ToolExecution).where(
+                        ToolExecution.task_id == task_id,
+                        ToolExecution.call_id == call_id,
+                    ))).scalars().first()
+                if row is None:  # 冲突后行又消失（对方回滚中）：按"占位在他人"处理
+                    return False, None
+                if row.error_type == TOOL_CLAIM_IN_FLIGHT:
+                    return False, None
+                return False, _tool_exec_dict(row)
+
+    async def complete_tool_execution(self, task_id: str, call_id: str, obs: dict) -> None:
+        """M3：把认领到的占位回填为真实结果。
+
+        - 行是占位 → 回填（认领者自己的正常出口）；
+        - 行已完成 → **不覆盖**，warn 记一笔：先写者为准，静默分叉不可接受；
+        - 行不存在（未走认领路径/被清理）→ 退化为直接记录。
+        """
         async with self.session_factory() as session:
             row = (await session.execute(
                 select(ToolExecution).where(
                     ToolExecution.task_id == task_id,
                     ToolExecution.call_id == call_id,
                 ))).scalars().first()
-            return _tool_exec_dict(row) if row else None
+            if row is None:
+                session.add(ToolExecution(
+                    task_id=task_id, call_id=call_id,
+                    tool=str(obs.get("tool", "")),
+                    arguments=json.dumps(obs.get("arguments", {}), ensure_ascii=False, default=str),
+                    ok=bool(obs.get("ok", False)),
+                    result=json.dumps(obs.get("result"), ensure_ascii=False, default=str)
+                    if obs.get("result") is not None else "",
+                    error=str(obs.get("error", "")),
+                    error_type=str(obs.get("error_type", "")),
+                ))
+            elif row.error_type == TOOL_CLAIM_IN_FLIGHT:
+                row.tool = str(obs.get("tool", row.tool))
+                row.arguments = json.dumps(obs.get("arguments", {}), ensure_ascii=False, default=str)
+                row.ok = bool(obs.get("ok", False))
+                row.result = (json.dumps(obs.get("result"), ensure_ascii=False, default=str)
+                              if obs.get("result") is not None else "")
+                row.error = str(obs.get("error", ""))
+                row.error_type = str(obs.get("error_type", ""))
+            else:
+                log.warning("工具流水分叉：call_id=%s 已被更早的结果完成，本次结果不覆盖 task=%s",
+                            call_id, task_id)
+                return
+            try:
+                await session.commit()
+            except IntegrityError:
+                # 无行分支与他人并发插入相撞：以先落库者为准，回填不生效但无害
+                await session.rollback()
+                log.warning("工具流水回填撞唯一约束（先写者为准）task=%s call_id=%s",
+                            task_id, call_id)
 
     async def record_tool_execution(self, task_id: str, call_id: str, obs: dict) -> None:
         """记录一次工具调用结果。幂等：重复记录以首次为准，不抛错。
+
+        注意：新执行路径走 try_claim + complete（M3）；本方法保留给
+        "不带认领的记录/回放"语义（旧数据兼容与直接落库）。
 
         obs 形态与节点内的观测字典一致：
         {"tool","arguments","ok","result"|"error","error_type"}
@@ -446,8 +688,11 @@ class Repository:
             try:
                 await session.commit()
             except IntegrityError:
-                # (task_id, call_id) 唯一约束冲突：已被更早的调用记录过，以首次为准
+                # (task_id, call_id) 唯一约束冲突：已被更早的调用记录过，以首次为准。
+                # M3：不再静默 —— 冲突意味着两处结果不一致的可能，留痕供排查。
                 await session.rollback()
+                log.warning("工具流水重复记录被忽略（以首次为准）task=%s call_id=%s",
+                            task_id, call_id)
 
     # ---------- 指标 ----------
     async def metrics(self, tenant_id: str | None = None) -> dict:

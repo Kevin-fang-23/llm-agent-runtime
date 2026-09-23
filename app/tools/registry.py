@@ -71,6 +71,9 @@ class ToolSpec:
     # 因此只有只读/天然幂等的工具才打开（web_search / get_weather / db_query），
     # 写类与有副作用类（file_ops / code_run / subagent）保持关闭。
     retry_transient: bool = False
+    # 是否会产生外部可见副作用（写文件 / 执行代码 / 派生子任务）。
+    # 唯一事实来源：MCP 服务端据此在工具描述与 stdio 启动日志中标注警示（C6）。
+    side_effect: bool = False
     validator: jsonschema.protocols.Validator = field(init=False)
 
     def __post_init__(self):
@@ -136,8 +139,6 @@ class ToolRegistry:
         started = time.monotonic()
         try:
             result = await asyncio.wait_for(spec.handler(arguments), timeout=spec.timeout_s)
-        except ToolValidationError:
-            raise
         except asyncio.TimeoutError:
             raise ToolExecutionError(
                 f"工具 {name} 执行超时（>{spec.timeout_s}s）",

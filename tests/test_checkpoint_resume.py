@@ -74,3 +74,14 @@ async def test_resume_completed_task_is_noop(settings, registry):
     await engine.run_task("t10", "简单任务", "react", 60000, 24)
     final = await engine.resume_task("t10")  # 已到 END：幂等
     assert final["status"] == STATUS_DONE
+
+
+async def test_resume_without_checkpoint_raises(settings, registry):
+    """无任何 checkpoint 的任务 resume 必须显式报错，而不是静默返回空状态 ——
+    否则队列层 `final.get("status", "done")` 会把它写成 done（假完成）。
+    与「已到 END」的幂等返回（values 非空）是两种可区分的情形。"""
+    from langgraph.checkpoint.memory import MemorySaver
+
+    engine, _ = make_engine(settings, [], registry, saver=MemorySaver())
+    with pytest.raises(ValueError, match="无可恢复"):
+        await engine.resume_task("never-ran")

@@ -5,13 +5,15 @@
 - 事件通过 event_sink 异步回调输出（CLI 打印 / API 层写库），引擎不感知存储。
 - 工具执行流水由 journal 注入（同样只依赖 Protocol，不依赖 storage 层）：
   checkpoint 落在 superstep 边界，若进程在 tool_executor 执行中被杀，
-  恢复会重跑该节点 —— journal 以 (task_id, call_id) 为幂等键拦住第二次执行。
+  恢复会重跑该节点 —— journal 以 (task_id, 调用键) 为幂等键拦住第二次执行。
+  调用键含轮次与参数指纹（M3），认领/回填两步原子化，杜绝并发双跑（见 ToolJournal）。
 - 可观测性：执行期间绑定 task_id / trace_id 到 ContextVar，使**每一条**日志
   都能被自动标注（`app/observability/logging.py` 的 Filter），事件流也带上
   trace_id；指标（任务数/耗时/在飞数/事件数）在同一处自增。
 """
 from __future__ import annotations
 
+import asyncio
 import time
 from contextvars import ContextVar
 from typing import Any, Awaitable, Callable, Protocol
@@ -20,7 +22,11 @@ from langgraph.graph import END, START, StateGraph
 
 from app.config import Settings
 from app.graph.nodes import GraphNodes, init_state
-from app.graph.state import AgentState
+from app.graph.state import (
+    STATUS_DONE,
+    STATUS_WAITING_APPROVAL,
+    AgentState,
+)
 from app.observability import context as obs_context
 from app.observability import metrics as obs_metrics
 from app.observability import spans as obs_spans
@@ -40,6 +46,27 @@ class ToolJournal(Protocol):
 
     async def record_tool_execution(self, task_id: str, call_id: str, obs: dict) -> None: ...
 
+    async def try_claim_tool_execution(self, task_id: str, call_id: str,
+                                       tool: str, arguments: dict) -> tuple[bool, dict | None]:
+        """M3 原子认领：以"插入占位行"裁决归属，替代查后写的竞态窗口。
+
+        返回三态（调用方据此决策，不感知占位行的存储形态）：
+          (True,  None) —— 认领成功，调用方负责执行并 complete；
+          (False, dict) —— 该调用已完成，直接回放 dict；
+          (False, None) —— 占位在他人手里（并发执行中或执行中死亡），
+                           调用方应轮询 get_tool_execution 等待其完成。
+        """
+        ...
+
+    async def complete_tool_execution(self, task_id: str, call_id: str, obs: dict) -> None:
+        """M3：把认领到的占位回填为真实结果；行已不存在时退化为记录。"""
+        ...
+
+    async def get_max_event_seq(self, task_id: str) -> int:
+        """H11：该任务已落库事件的最大 seq。引擎在 run/resume 入口用它给
+        每任务 seq 计数器播种，崩溃恢复换引擎后事件续号而不是从 1 撞号。"""
+        ...
+
 
 class SpanSink(Protocol):
     """span 落库契约（由 storage.Repository 结构化实现）。
@@ -52,12 +79,21 @@ class SpanSink(Protocol):
     async def record_spans(self, spans: list[dict]) -> None: ...
 
 
-# 当前任务 id（asyncio 上下文隔离）：subagent 工具据此把子事件路由回正确的父任务轨迹
-_current_task_id: ContextVar[str] = ContextVar("agent_task_id", default="")
+# 当前任务 id（asyncio 上下文隔离）：subagent 工具据此把子事件路由回正确的父任务轨迹。
+# M2：变量本体上移到 observability/context.py（span 闭合时要读它做任务归属，
+# 而 observability 不能反向 import graph）；这里保留别名，既有导入点零改动。
+_current_task_id = obs_context.task_id_var
 
 # 把 task_id 的 ContextVar 交给 observability 层，使日志 Filter 能读到它
 # （依赖方向保持单向：graph → observability，observability 不反向依赖业务包）
 bind_task_id_var(_current_task_id)
+
+# C3：当前正在执行任务的引擎实例。subagent 工具据此把子事件转发回**调用方**
+# 的轨迹——旧实现是引擎构建时向共享注册表的 handler 对象上写 parent_engine，
+# 同一注册表被第二个引擎复用时指针会被静默改指新引擎（事件路由错父）。
+# ContextVar 随 asyncio 任务上下文隔离，_execute 进入时 set、finally 复位。
+_current_engine: ContextVar[AgentEngine | None] = ContextVar(
+    "agent_current_engine", default=None)
 
 
 class AgentEngine:
@@ -81,18 +117,14 @@ class AgentEngine:
         self.span_sink = span_sink
         self.nodes = GraphNodes(self)
         self._canceled: set[str] = set()
-        self._seq = 0
+        # H11：seq 每任务独立计数（task_id → 已发出的最大 seq）。旧实现是
+        # 进程级单计数器，恢复换引擎后从 1 重来 —— 与旧事件撞号、且恒小于
+        # after_seq 订阅水位，恢复后新事件在增量拉取里永久隐身。
+        self._seqs: dict[str, int] = {}
         # 每个 task_id 已落库的 span 数：用于 spans_max_per_task 上限
         # （防止异常循环把表写爆；正常任务量级在数十条，远不到上限）
         self._span_counts: dict[str, int] = {}
         self.graph = self._build(interrupt_before)
-        # 注册表里若有 subagent 工具，回填父引擎引用（子事件转发用）
-        try:
-            from app.tools.subagent import attach_parent_engine
-
-            attach_parent_engine(registry, self)
-        except Exception:  # noqa: BLE001 无 subagent 工具或回填失败不影响主流程
-            pass
 
     # ---------- 图装配 ----------
     def _build(self, interrupt_before: list[str] | None):
@@ -113,7 +145,7 @@ class AgentEngine:
         g.add_conditional_edges("react_step", self.nodes.route_after_step,
                                 {"tool_executor": "approval_gate", "finisher": "finisher"})
         g.add_conditional_edges("approval_gate", self.nodes.route_after_gate,
-                                {"tool_executor": "tool_executor", "end": END})
+                                {"tool_executor": "tool_executor", "finisher": "finisher"})
         g.add_edge("tool_executor", "critic")
         g.add_conditional_edges("critic", self.nodes.route_after_critic,
                                 {"planner": "planner", "compressor": "compressor", "finisher": "finisher"})
@@ -122,10 +154,27 @@ class AgentEngine:
         return g.compile(checkpointer=self.saver, interrupt_before=interrupt_before)
 
     # ---------- 事件 ----------
+    async def _seed_seq(self, task_id: str) -> None:
+        """run/resume 入口给该任务的 seq 计数器播种为 max(库中已有, 当前值)。
+
+        journal 未注入（CLI/单测）时不播种：无库可续，进程内每任务从 1 编号
+        依然自洽。取 max 而不是直接覆盖：同进程重复 resume 时内存计数可能
+        已领先库中值（sink 非落库实现），不能被回拨。
+        """
+        if self.journal is None:
+            return
+        try:
+            stored = await self.journal.get_max_event_seq(task_id)
+        except Exception:  # noqa: BLE001 播种失败不拦任务执行，撞号由唯一约束兜底
+            return
+        if stored > self._seqs.get(task_id, 0):
+            self._seqs[task_id] = stored
+
     async def emit(self, state: AgentState, event_type: str, payload: dict) -> None:
-        self._seq += 1
+        tid = state.get("task_id", "")
+        self._seqs[tid] = self._seqs.get(tid, 0) + 1
         event = {
-            "seq": self._seq,
+            "seq": self._seqs[tid],
             "task_id": state.get("task_id", ""),
             # trace_id 随事件落到 events 表，与日志里的 trace_id 同源：
             # 因此「日志 → 事件流 → 上游 collector」三处可用同一个 id 互相对齐
@@ -158,19 +207,22 @@ class AgentEngine:
         return obs_spans.begin_span(kind, name, attributes=attributes or None)
 
     async def flush_spans(self, task_id: str) -> int:
-        """把缓冲里已闭合的 span 批量落库，返回写入条数。
+        """把该任务名下已闭合的 span 批量落库，返回写入条数。
 
-        调用点选在 `run_task` / `resume_task` 的**正常返回路径**（不是 finally）：
-        span 落库失败绝不能影响任务结果，因此这里吞掉异常并降级为告警日志 ——
-        与 journal（幂等去重，失败必须暴露）的严格策略**刻意不同**。
+        调用点选在 `run_task` / `resume_task` 的**正常返回路径与异常路径**（非
+        finally）：span 落库失败绝不能影响任务结果，因此这里吞掉异常并降级为
+        告警日志 —— 与 journal（幂等去重，失败必须暴露）的严格策略**刻意不同**。
+
+        M2：只取走**本任务**的 span（归属在开 span 时已捕获）。旧实现把进程级缓冲
+        整体盖上当前 task_id —— 并发执行时先结束的任务会把别人的 span 记到自己
+        账上，异常任务滞留的 span 则被下一个成功任务"收割"。
         """
         if self.span_sink is None:
-            # 没接 sink 时也要清缓冲，否则同一进程跑多个任务会串（缓冲是进程级）
+            # 没接 sink 时整体清缓冲：无处可写，留着只会白占内存（进程级缓冲）
             obs_spans.BUFFER.drain()
             return 0
-        pending = [s for s in obs_spans.BUFFER.drain() if s.get("trace_id") != "-"]
-        for s in pending:
-            s["task_id"] = task_id
+        pending = [s for s in obs_spans.BUFFER.drain_for(task_id)
+                   if s.get("trace_id") != "-"]
         if not pending:
             return 0
         used = self._span_counts.get(task_id, 0)
@@ -199,6 +251,17 @@ class AgentEngine:
         self._span_counts[task_id] = used + len(pending)
         return len(pending)
 
+    async def _flush_spans_quietly(self, task_id: str) -> None:
+        """异常路径专用 flush：绝不抛出，包括二次取消。
+
+        shield 让落库协程不被外层取消打断（任务被 cancel 时这轮 span 同样要出账，
+        否则树残缺）；外层吞掉一切异常 —— 观测数据的账不能盖住任务的真实异常。
+        """
+        try:
+            await asyncio.shield(self.flush_spans(task_id))
+        except BaseException:  # noqa: BLE001, S110 — 刻意吞尽：观测收尾不得盖住调用方正在抛出的真异常
+            pass
+
     # ---------- 取消（协作式：节点在边界处检查） ----------
     def cancel(self, task_id: str) -> None:
         self._canceled.add(task_id)
@@ -209,10 +272,20 @@ class AgentEngine:
     def is_canceled(self, task_id: str) -> bool:
         return task_id in self._canceled
 
-    def _config(self, task_id: str) -> dict:
+    def _config(self, task_id: str, max_steps: int = 0) -> dict:
+        # M1：recursion_limit 按**任务级** max_steps 计算。旧实现恒用全局默认
+        # （default_max_steps*4+24）：提交时把步数预算调到 200 的任务，约 24~30 轮
+        # 就被 GraphRecursionError 打断 —— 等于步数参数在图执行层被静默钳制。
+        # max_steps 缺省/非法（只读路径不会传）时退回全局默认。
+        try:
+            steps = int(max_steps)
+        except (TypeError, ValueError):
+            steps = 0
+        if steps <= 0:
+            steps = max(int(self.settings.default_max_steps), 1)
         cfg: dict = {
             "configurable": {"thread_id": task_id},
-            "recursion_limit": self.settings.default_max_steps * 4 + 24,
+            "recursion_limit": steps * 4 + 24,
         }
         if self.saver is not None:
             # 见 app/config.py::checkpoint_durability 的说明：
@@ -221,6 +294,61 @@ class AgentEngine:
         return cfg
 
     # ---------- 执行 ----------
+    async def _execute(self, task_id: str, invoke_arg: Any, *, max_steps: int,
+                       span_name: str, span_attributes: dict,
+                       traceparent: str | None = None) -> AgentState:
+        """run_task / resume_task 的共享执行主体（A4：此前两份约 35 行的近似重复）。
+
+        统一口径顺带修掉一处漂移：旧 run_task 只在 require_approval 时检查挂起，
+        resume 则无条件检查 —— 现在两边都无条件检查。挂起判定需要 checkpointer，
+        saver 未注入时图本就不可能停在 interrupt 上，跳过即可。
+        trace/span/指标/事件 seq 的生命周期全部收在这一层，两个入口不再各自维护。
+        """
+        trace_id, trace_token = obs_context.bind_trace(traceparent)
+        ctx_token = _current_task_id.set(task_id)
+        engine_token = _current_engine.set(self)
+        await self._seed_seq(task_id)  # H11：重复提交同 task_id 也不与既有事件撞号
+        started = time.perf_counter()
+        obs_metrics.TASKS_INFLIGHT.inc()
+        # root span：整个任务执行是 span 树的根。用 begin_span 显式管理生命周期 ——
+        # 它必须在所有子 span 闭合之后、函数返回之前结束（见 SpanSession 的说明）
+        root = self.begin_span(obs_spans.KIND_TASK, span_name, **span_attributes)
+        try:
+            final: AgentState = await self.graph.ainvoke(
+                invoke_arg, config=self._config(task_id, max_steps))
+        except BaseException as exc:
+            # 先闭合 root（标记 error），再走 finally 的清理；两处职责不重叠 ——
+            # root.end 幂等，finally 只管指标与 ContextVar
+            root.end(exc)
+            # M2：异常路径同样收尾 —— 不 flush 的话这批 span 滞留缓冲，
+            # 等同任务下一次执行才被取走（永远不再执行就占内存到进程结束）
+            await self._flush_spans_quietly(task_id)
+            raise
+        finally:
+            obs_metrics.TASKS_INFLIGHT.dec()
+            _current_engine.reset(engine_token)
+            _current_task_id.reset(ctx_token)
+            obs_context.trace_id_var.reset(trace_token)
+        # 停在审批门上：ainvoke 正常返回（interrupt 挂起），但任务并未完成 ——
+        # 置 waiting_approval 交给队列写回任务行。多轮审批的 resume 同样命中此处
+        if self.saver is not None and await self.is_paused(task_id):
+            final = {**final, "status": STATUS_WAITING_APPROVAL}
+        status = final.get("status") or STATUS_DONE
+        root.set_attribute("status", status)
+        root.end()
+        # span 落库放在这里（不是 finally）：先让 root span 闭合，再一次性写缓冲，
+        # 这样同一 trace 的 span 都在同一次 batch 里，batch 数量 = 1
+        await self.flush_spans(task_id)
+        # waiting_approval 不是终态：计入耗时直方图会让 P95 被"审批等待"污染，
+        # 所以只统计真正跑完的轮次，挂起轮次单独计数
+        obs_metrics.TASKS_TOTAL.inc({"status": status})
+        if status != STATUS_WAITING_APPROVAL:
+            obs_metrics.TASK_DURATION.observe(time.perf_counter() - started,
+                                              {"status": status})
+        if trace_id:
+            final = {**final, "trace_id": trace_id}
+        return final
+
     async def run_task(self, task_id: str, goal: str, mode: str,
                        max_tokens: int, max_steps: int,
                        require_approval: bool = False,
@@ -232,45 +360,13 @@ class AgentEngine:
         （`asyncio.create_task` 之后的上下文不继承请求上下文），Celery 路径更是
         另一个进程 —— 显式绑定是唯一在两种队列形态下都成立的做法。
         """
-        trace_id, trace_token = obs_context.bind_trace(traceparent)
         state = init_state(task_id, goal, mode, max_tokens, max_steps,
                            require_approval=require_approval)
-        ctx_token = _current_task_id.set(task_id)
-        started = time.perf_counter()
-        obs_metrics.TASKS_INFLIGHT.inc()
-        # root span：整个任务执行是 span 树的根。用 begin_span 显式管理生命周期 ——
-        # 它必须在所有子 span 闭合之后、函数返回之前结束（见 SpanSession 的说明）
-        root = self.begin_span(obs_spans.KIND_TASK, "run_task",
-                               goal_len=len(goal or ""), mode=mode)
-        try:
-            final: AgentState = await self.graph.ainvoke(state, config=self._config(task_id))
-        except BaseException as exc:
-            # 先闭合 root（标记 error），再走 finally 的清理；两处职责不重叠 ——
-            # root.end 幂等，finally 只管指标与 ContextVar
-            root.end(exc)
-            raise
-        finally:
-            obs_metrics.TASKS_INFLIGHT.dec()
-            _current_task_id.reset(ctx_token)
-            obs_context.trace_id_var.reset(trace_token)
-        # require_approval 任务在审批门挂起：ainvoke 正常返回（停在 interrupt 上），
-        # 但任务并未完成 —— 用 checkpoint 位置区分，置 waiting_approval 交给队列写回任务行
-        if require_approval and await self.is_paused(task_id):
-            final = {**final, "status": "waiting_approval"}
-        root.set_attribute("status", final.get("status", "done"))
-        root.end()
-        # span 落库放在这里（不是 finally）：先让 root span 闭合，再一次性写缓冲，
-        # 这样同一 trace 的 span 都在同一次 batch 里，batch 数量 = 1
-        await self.flush_spans(task_id)
-        # waiting_approval 不是终态：计入耗时直方图会让 P95 被"审批等待"污染，
-        # 所以只统计真正跑完的轮次，挂起轮次单独计数
-        obs_metrics.TASKS_TOTAL.inc({"status": final.get("status", "done")})
-        if final.get("status") != "waiting_approval":
-            obs_metrics.TASK_DURATION.observe(
-                time.perf_counter() - started, {"status": final.get("status", "done")})
-        if trace_id:
-            final = {**final, "trace_id": trace_id}
-        return final
+        return await self._execute(
+            task_id, state, max_steps=max_steps,
+            span_name="run_task",
+            span_attributes={"goal_len": len(goal or ""), "mode": mode},
+            traceparent=traceparent)
 
     async def resume_task(self, task_id: str,
                           resume_value: Any | None = None) -> AgentState:
@@ -284,47 +380,28 @@ class AgentEngine:
         config = self._config(task_id)
         snap = await self.graph.aget_state(config)
         if not snap.next:  # 已到 END：无可恢复内容
-            return dict(snap.values or {})
+            if not snap.values:
+                # 从未执行过（无任何 checkpoint）：不能静默返回空状态 ——
+                # 队列层 `final.get("status", "done")` 会把它写成 done（假完成）。
+                # 队列的异常兜底会保持 failed 并把本消息写进 error 字段。
+                raise ValueError(
+                    "无可恢复的断点：任务从未执行过（无任何 checkpoint），请重新提交任务")
+            return dict(snap.values)
         if resume_value is None and any(t.interrupts for t in (snap.tasks or ())):
             # checkpoint 上挂着未决的审批 interrupt：ainvoke(None) 无法跨越它，
             # 必须显式给出决策（approve/reject 端点负责传递）
             raise ValueError("任务在等待人工审批，请通过 /approve 或 /reject 提供决策")
-        trace_id, trace_token = obs_context.bind_trace()
-        ctx_token = _current_task_id.set(task_id)
-        started = time.perf_counter()
-        obs_metrics.TASKS_INFLIGHT.inc()
-        # 恢复是**新 trace**（审批决策来自另一个请求）：因此 root span 也另起一棵树，
-        # 与上一轮的 span 通过事件流的 seq 关联，而不是靠同一 trace_id 硬串
-        root = self.begin_span(obs_spans.KIND_TASK, "resume_task",
-                               resumed=resume_value is not None)
-        try:
-            if resume_value is not None:
-                from langgraph.types import Command
+        # M1：恢复用的步数预算取自 checkpoint 里的任务级 max_steps
+        #（快照读取本身与 recursion_limit 无关，用默认值即可）
+        from langgraph.types import Command
 
-                final: AgentState = await self.graph.ainvoke(
-                    Command(resume=resume_value), config=config)
-            else:
-                final: AgentState = await self.graph.ainvoke(None, config=config)
-        except BaseException as exc:
-            root.end(exc)
-            raise
-        finally:
-            obs_metrics.TASKS_INFLIGHT.dec()
-            _current_task_id.reset(ctx_token)
-            obs_context.trace_id_var.reset(trace_token)
-        # 多轮审批：这一轮工具跑完、critic 回到决策步、下一轮工具又在门上挂起
-        if await self.is_paused(task_id):
-            final = {**final, "status": "waiting_approval"}
-        root.set_attribute("status", final.get("status", "done"))
-        root.end()
-        await self.flush_spans(task_id)
-        obs_metrics.TASKS_TOTAL.inc({"status": final.get("status", "done")})
-        if final.get("status") != "waiting_approval":
-            obs_metrics.TASK_DURATION.observe(
-                time.perf_counter() - started, {"status": final.get("status", "done")})
-        if trace_id:
-            final = {**final, "trace_id": trace_id}
-        return final
+        invoke_arg = (Command(resume=resume_value) if resume_value is not None
+                      else None)
+        return await self._execute(
+            task_id, invoke_arg,
+            max_steps=(snap.values or {}).get("max_steps", 0),
+            span_name="resume_task",
+            span_attributes={"resumed": resume_value is not None})
 
     async def is_paused(self, task_id: str) -> bool:
         """是否停在审批门（interrupt）上。next 非空即意味着图在节点前挂起。"""

@@ -8,7 +8,8 @@
 - trace 是**请求级上下文**，不是任务状态：`resume` 一次恢复应当延续原 trace，
   而 `cancel` 决策来自另一个请求（另一条 trace）—— 用 ContextVar 天然表达
   "谁在什么时候触发了什么"，比把最后一个写入者存进状态更准确。
-- 与既有 `_current_task_id`（`app/graph/engine.py:38`）同一套机制，风格一致。
+- 与既有 `_current_task_id`（现定义于本模块 `task_id_var`，engine 侧保留别名）
+  同一套机制，风格一致。
 
 trace_id 由 `run_task` / `resume_task` 的入口显式绑定：这样**后台队列**（任务由
 `LocalTaskQueue` 协程拉起，不在 HTTP 请求上下文里）与 **HTTP 请求路径**走的是同
@@ -34,6 +35,12 @@ from dataclasses import dataclass
 
 # 当前 trace id（asyncio 上下文隔离）。空串 = 未绑定，此时日志/指标退化为"无 trace"。
 trace_id_var: ContextVar[str] = ContextVar("agent_trace_id", default="")
+
+# 当前任务 id（M2）：span 落库的归属依据。原先定义在 app/graph/engine.py
+# （供日志 Filter 与 subagent 使用），但 observability 层不得反向依赖 graph ——
+# 而 span 缓冲恰恰需要"闭合时就知道自己属于哪个任务"才能杜绝跨任务串扰。
+# 上移到此处后，engine._current_task_id 只是它的别名（既有导入点零改动）。
+task_id_var: ContextVar[str] = ContextVar("agent_task_id", default="")
 
 # 当前 span id：嵌套 span 的 parent 来源。空串 = 尚无 span（root span 以入站 parent_id
 # 或全零作为父）。

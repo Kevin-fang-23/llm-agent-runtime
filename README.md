@@ -20,7 +20,7 @@
 | 任务中断恢复（checkpoint） | LangGraph checkpointer 落 SQLite/PostgreSQL，进程崩溃后 `ainvoke(None)` 从断点续跑。**工具执行流水以 `(task_id, call_id)` 为幂等键**：checkpoint 重跑节点时回放已提交结果而非再执行一次（覆盖"工具已返回、流水已提交，但 checkpoint 未提交"的崩溃窗口） | `app/graph/engine.py` `resume_task`、`app/storage/models.py` `ToolExecution` |
 | Function Calling | 模型侧 OpenAI function calling，`tool_calls` 回填 `tool_call_id` 关联 | `app/core/llm.py`、`nodes.py` `_assistant_message` |
 | MCP 服务端 | `app/mcp_server.py` 以 **stdio** 传输实现 `tools/list` + `tools/call`，可被任意 MCP 客户端接入（Claude Desktop / `mcp` CLI 等）；工具的 `inputSchema` 直接复用 registry 的 JSON Schema，调用走 `registry.execute()`，沙箱与结构化错误码全部复用 | `python -m app.mcp_server` |
-| LangGraph 状态机持久化 | StateGraph 六节点 + 条件边，checkpointer 可插拔（SQLite/PG） | `app/graph/engine.py` `_build` |
+| LangGraph 状态机持久化 | StateGraph 七节点 + 条件边，checkpointer 可插拔（SQLite/PG） | `app/graph/engine.py` `_build` |
 | Docker 沙箱隔离 | network_disabled + mem_limit + nano_cpus + pids_limit + read_only + tmpfs + uid 65534 | `DockerSandbox` |
 | 异步任务队列 | 默认进程内 asyncio 队列（零依赖）；生产切 Celery+Redis（`QUEUE_MODE=celery`），**Celery 任务体 / API 分发 / Redis broker 往返均有集成测试** | `app/worker/local_queue.py`、`celery_app.py` |
 | PostgreSQL 存储执行图 | 业务库 SQLAlchemy 异步（tasks/events 表），checkpoint 走 `langgraph-checkpoint-postgres` | `app/storage/` |
@@ -28,7 +28,7 @@
 | 结构化校验与自愈循环 | jsonschema Draft 2020-12 校验 → 失败回喂 REPAIR 提示词 → 重校验 → 循环 | `app/tools/registry.py` `validate` |
 | 并发子 Agent 资源调度 | 任务级信号量（`MAX_CONCURRENT_TASKS`）+ 工具级信号量（`MAX_CONCURRENT_TOOLS`），一轮多工具 asyncio.gather 并行 | `local_queue.py` / `tool_executor_node` |
 | token/步数双维度预算 | 步数或 token 超限→降级便宜模型续跑一次→再超限则带已完成数据优雅终止 | `app/core/budget.py` |
-| 鉴权 / 多租户 / 限流 | API Key 鉴权（SHA-256 哈希落库，明文仅创建时返回一次）+ 租户隔离（跨租户一律 404）+ 四层额度判定：每 IP 每分钟 → 每租户每分钟 → 每租户/全局每日提交数 → 每租户每日 token 配额（实耗 + 在途预占，判定即查 tasks 表事实来源）；分钟级计数 `RATE_LIMIT_STORE` 双形态：memory 滑动窗口（单进程零库往返）/ **db 原子 UPSERT（多 worker 共享同一份额度）**；管理端点管理租户生命周期 | `app/api/security.py`、`app/api/ratelimit.py`、`app/api/routes_admin.py` |
+| 鉴权 / 多租户 / 限流 | API Key 鉴权（SHA-256 哈希落库，明文仅创建时返回一次）+ 租户隔离（跨租户一律 404）+ 管理密钥爆破限流（成功尝试也计数）+ 凭据文件 0600/去 ACL 继承加固 + 四层额度判定：每 IP 每分钟 → 每租户每分钟（前置判定）→ 每租户/全局每日提交数 → 每租户每日 token 配额（实耗 + 在途预占，判定即查 tasks 表事实来源；**日级为"先落任务行占位、再判定、超限回滚删除"**，并发窗口下少发而不超发）；SSE 长连接走并发闸门（每租户/全局，超配 429 + `Retry-After`）；分钟级计数 `RATE_LIMIT_STORE` 双形态：memory 滑动窗口（单进程零库往返）/ **db 原子 UPSERT（多 worker 共享同一份额度）**；管理端点管理租户生命周期 | `app/api/security.py`、`app/api/ratelimit.py`、`app/api/routes_admin.py` |
 | 可观测性（trace + 指标 + 结构化日志） | **零依赖**手写 Prometheus exposition（`/metrics`，`text/plain; version=0.0.4`）+ W3C `traceparent` 入站透传/自生成 + `contextvars` 贯穿任务全链路 + JSON 结构化日志自动注入 `task_id`/`trace_id`；标签严守低基数纪律（任何 ID 都不做标签） | `app/observability/` |
 
 ## 二、量化指标（`python scripts/metrics.py` 实测）
@@ -125,7 +125,7 @@ python scripts/demo_cli.py --offline   # 全链路：ReAct → 并行工具 → 
 | Job | 内容 |
 |---|---|
 | `static` | `ruff --select E9,F63,F7,F82`（**F821 未定义名**，专拦"缺 import 导致导入期崩溃"）+ `compileall` + `import app.main` / `import app.worker.celery_app` 冒烟 |
-| `test` | 375 条离线用例（含注入 `SEARCH_PROVIDER=bing` 的对抗步骤），结果与机器无关；celery 路径整体归入 `integration` job（其外部服务用例在 CI 上真跑，放离线套件会破坏确定性口径） |
+| `test` | 600 条离线用例（含注入 `SEARCH_PROVIDER=bing` 的对抗步骤），结果与机器无关；celery 路径整体归入 `integration` job（其外部服务用例在 CI 上真跑，放离线套件会破坏确定性口径） |
 | `integration` | Docker 沙箱 4 例（无挂载执行 / 出网被拦 / uid=65534 / 超时被杀）+ PostgreSQL checkpoint 2 例 + PG 租户列迁移 1 例 + PG Alembic 自举 1 例 + **Celery 路径 6 例（eager 任务体 3 / API 分发 1 / Redis 真实 broker 往返：API → Redis → 独立 worker 子进程 → DB 1 / Celery+PG 存储形态 1；worker 就绪判定用 `worker_ready` 信号标记文件，容器端口由 Docker 动态分配）**（本地无 daemon 自动 skip，CI 上会真跑） |
 | `smoke` | CLI 全链路 / 崩溃恢复 / **指标门禁**（恢复率与自愈率断言 100%）；三步均注入敌对 `SEARCH_PROVIDER=bing`，断言脚本仍自报 `mock` —— 防止"离线脚本偷偷联网"复发 |
 
@@ -153,7 +153,7 @@ python scripts/demo_cli.py --offline   # 全链路：ReAct → 并行工具 → 
 | GET | `/api/tasks/{id}/trace` | 全量轨迹事件 |
 | GET | `/api/tasks/{id}/spans?kind=` | **span 树**（父子关系 + 每 span 自耗时 `self_ms`，可按 `task`/`step`/`llm`/`tool` 过滤） |
 | GET | `/api/tasks/{id}/events?after=N` | 增量轮询（保留给不支持 SSE 的环境；前端已改走 `/stream`） |
-| GET | `/api/tasks/{id}/stream` | **SSE 推送**轨迹事件 + 任务快照，终态后推 `stream_end` 并关闭 |
+| GET | `/api/tasks/{id}/stream` | **SSE 推送**轨迹事件 + 任务快照，终态后推 `stream_end` 并关闭；受并发闸门约束（每租户 `SSE_MAX_CONCURRENT_PER_TENANT`，超配 429） |
 | GET | `/api/tasks/{id}/export?format=json\|md` | 导出轨迹（结构化 JSON / 可贴进报告的 Markdown） |
 | POST | `/api/tasks/{id}/resume` | 从 checkpoint 恢复 |
 | POST | `/api/tasks/{id}/cancel` | 协作式取消（节点边界优雅收尾） |
@@ -207,18 +207,18 @@ docker compose up --build                        # PG + Redis + API + Celery wor
 > 类报错的根因。Windows/Mac 上 docker.sock 挂载不可用时，建议 compose 只跑 PG+Redis，
 > worker 在宿主机运行（`QUEUE_MODE=celery REDIS_URL=redis://localhost:6379/0`）。
 
-沙箱安全模型（防三件事）：**数据外泄**（network_disabled 无出网能力）、**资源耗尽**（内存/CPU/进程数/时长四重限制）、**宿主污染**（只读根文件系统 + tmpfs /tmp + 非 root uid 65534 + 工作目录只读挂载）。以上四项均有自动化集成测试（`tests/test_docker_sandbox.py`，daemon 不可用自动跳过）。
+沙箱安全模型（防三件事）：**数据外泄**（network_disabled 无出网能力）、**资源耗尽**（内存/CPU/进程数/时长四重限制）、**宿主污染**（只读根文件系统 + tmpfs /tmp（noexec/nosuid/1777）+ 非 root uid 65534；代码经 argv 传入，容器无任何可写挂载）。以上均有自动化集成测试（`tests/test_docker_sandbox.py`，daemon 不可用自动跳过）。主服务镜像（`Dockerfile`）以 `appuser` 非 root 运行、PID 1 用 dumb-init 转发信号与回收僵尸；compose 形态的 worker 依赖镜像内的非 root 用户 + `group_add: ["docker"]` 访问 docker.sock（不再以 root 摸 socket）。
 
 ## 七、测试
 
 ```bash
 python -m pytest tests/ -q
-# 390 个用例：380 条本地直接可跑（含 celery eager 离线路径）；10 条需 Docker daemon /
-# PostgreSQL / Redis（不可用时自动 skip，CI 上会真跑）。
-# CI 口径：test job 收集 375（celery_path 整体归入 integration job），integration 14 条。
+# 614 个用例：600 条本地直接可跑（含 celery eager 离线路径），14 条需 Docker daemon /
+# PostgreSQL / Redis（不可用时自动 skip，CI 上会真跑；本地实测 604 passed / 10 skipped）。
+# CI 口径：test job 收集 600（celery_path 整体归入 integration job），integration 14 条。
 ```
 
-覆盖：ReAct 循环与并行工具、Plan-Execute 与重规划、**计划 DAG（deps 解析双形态 / Kahn 分层 / 非法计划三级兜底 / 分批并行端到端 / critic 整批推进 / ReAct↔Plan 自适应升降级 / replan id 顺延唯一）**、**Alembic 迁移（全新库 upgrade / 旧库补列 stamp / 幂等 / 列集合防漂移对照）**、自愈循环（成功 / 耗尽降级 / **配额按调用计** / **并发不互相挤占**）、步数与 token 预算（含模型降级）、上下文压缩、checkpoint 跨引擎恢复、**工具执行流水幂等（真实崩溃窗口 + 对照组）**、**瞬时错误退避重试（闸门 / 上限 / 取消 / 真实等待）**、工具 Schema / 路径越狱 / SQL 只读、子 Agent 委托与递归防护、API 全生命周期、**鉴权（401/403 语义、key 哈希、轮换、禁用）、租户隔离、四层限流与配额、零配置引导、旧库迁移**、**可观测性（traceparent 解析与贯穿 / **完整 span 树（父子关系、自耗时只扣直接子、孤儿与自环兜底、异常路径也闭合、上下文还原）** / Prometheus 文本格式 / **直方图分桶单调性与可配分桶（非法值逐项跳过 / 全非法才回退默认）** / 结构化日志 / **脱敏（8 条规则 + 递归 extra/args/异常栈 + 幂等不变量）** / **采样（首条必留 / 每 N 条留 1 / WARNING 永不丢 / Filter 顺序）** / **进程身份指标（低基数标签 / build_info 恒为 1 / PROCESS_INSTANCE 构成）** / `/metrics` 无高基数标签）**、**Celery 路径（eager 任务体 / API 分发 / Redis 真实 broker 往返：API → Redis → 独立 worker 子进程 → DB / Celery+PG 存储形态）**、Docker 沙箱隔离、PostgreSQL checkpoint（含租户列迁移与 Alembic 自举的 PG 分支）。
+覆盖：ReAct 循环与并行工具、Plan-Execute 与重规划、**计划 DAG（deps 解析双形态 / Kahn 分层 / 非法计划三级兜底 / 分批并行端到端 / critic 整批推进 / ReAct↔Plan 自适应升降级 / replan id 顺延唯一）**、**Alembic 迁移（全新库 upgrade / 旧库补列 stamp / 幂等 / 列集合防漂移对照 / 0003 补 server_default：裸 SQL 省列可写、0002 现场升级数据保留）**、自愈循环（成功 / 耗尽降级 / **配额按调用计** / **并发不互相挤占**）、步数与 token 预算（含模型降级）、上下文压缩、checkpoint 跨引擎恢复、**工具执行流水幂等（真实崩溃窗口 + 对照组）**、**瞬时错误退避重试（闸门 / 上限 / 取消 / 真实等待）**、工具 Schema / 路径越狱 / SQL 只读、子 Agent 委托与递归防护、API 全生命周期、**鉴权（401/403 语义、key 哈希、轮换、禁用）、租户隔离、四层限流与配额、零配置引导、旧库迁移**、**可观测性（traceparent 解析与贯穿 / **完整 span 树（父子关系、自耗时只扣直接子、孤儿与自环兜底、异常路径也闭合、上下文还原）** / Prometheus 文本格式 / **直方图分桶单调性与可配分桶（非法值逐项跳过 / 全非法才回退默认）** / 结构化日志 / **脱敏（8 条规则 + 递归 extra/args/异常栈 + 幂等不变量）** / **采样（首条必留 / 每 N 条留 1 / WARNING 永不丢 / Filter 顺序）** / **进程身份指标（低基数标签 / build_info 恒为 1 / PROCESS_INSTANCE 构成）** / `/metrics` 无高基数标签）**、**Celery 路径（eager 任务体 / API 分发 / Redis 真实 broker 往返：API → Redis → 独立 worker 子进程 → DB / Celery+PG 存储形态）**、Docker 沙箱隔离、PostgreSQL checkpoint（含租户列迁移与 Alembic 自举的 PG 分支）、**P0 低严重度两批（token 真/假同口径 / 顶层数组计划不丢步 / 队列停机收尾与重复提交拒绝 / critic 步号按位置映射 / SEARCH_PROVIDER 配错启动即拒 / httpx 按循环共享连接池）**、**P1 批次一（registry 死代码删除后校验错误语义不变 / span 签名剔除从未使用的 sink / 凭据 SecretStr _repr 打码 + checkpoint_durability Literal 构造期校验）**、**P1 批次二（任务归属校验下沉 owned_task 依赖后 11 个端点 404/跨租户 404/状态 409 语义逐路径回归 / 主镜像非 root + dumb-init 与沙箱 tmpfs noexec 配置钉住）**。
 
 ## 八、目录结构
 
@@ -230,7 +230,7 @@ app/
   core/compressor.py   上下文压缩 + key_outputs 不可压缩注入
   core/retry.py        瞬时错误判别与指数退避（critic 与自动重试共用的单一判定点）
   graph/state.py       AgentState（状态机单一事实来源）
-  graph/nodes.py       六节点：planner/react_step/tool_executor/critic/compressor/finisher
+  graph/nodes.py       七节点：planner/react_step/approval_gate/tool_executor/critic/compressor/finisher
   graph/engine.py      StateGraph 装配 + run/resume/cancel + 事件广播 + ToolJournal 注入点
   tools/registry.py    MCP 风格注册表（JSON Schema 校验 + retry_transient 声明）
   tools/*.py           web_search / get_weather / code_run / db_query / file_ops / subagent
@@ -243,8 +243,8 @@ app/
 web/index.html         轨迹可视化（零依赖单页）
 sandbox/Dockerfile     代码执行沙箱镜像（python:3.11-slim 最小化）
 scripts/               CLI 演示 / 崩溃恢复演示 / 指标脚本 / Mock LLM / 种子库
-migrations/            Alembic 迁移（baseline 由 autogenerate 生成 + async env）
-tests/                 390 个测试（380 离线 + 10 需 Docker/PG/Redis）
+migrations/            Alembic 迁移（baseline autogenerate + 0002 唯一约束 + 0003 server_default + async env）
+tests/                 614 个测试（600 离线 + 14 需 Docker/PG/Redis）
 docs/                  目标差距评估与 P0/P1 修复记录 + 架构图与界面截图（images/）
 .github/workflows/     CI 四道门禁
 requirements.txt       直接依赖的兼容范围（`>=`）

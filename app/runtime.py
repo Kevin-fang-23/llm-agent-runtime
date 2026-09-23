@@ -22,9 +22,11 @@ from app.tools.factory import build_default_registry
 def build_llm(settings: Settings) -> ChatLLM:
     return OpenAIChatLLM(
         base_url=settings.llm_base_url,
-        api_key=settings.llm_api_key,
+        api_key=settings.llm_api_key.get_secret_value(),
         default_model=settings.llm_model,
         fallback_model=settings.llm_model_cheap,
+        timeout_s=settings.llm_timeout_s,
+        max_retries=settings.llm_max_retries,
     )
 
 
@@ -68,6 +70,12 @@ async def build_saver(settings: Settings) -> tuple[Any, Callable[[], Any] | None
     from langgraph.checkpoint.sqlite.aio import AsyncSqliteSaver
 
     conn = await aiosqlite.connect(settings.checkpoint_sqlite_path)
+    # H7：checkpoint 库与业务库同样多进程共写（API 进程 resume 与 worker 执行
+    # 可能碰同一文件），默认 journal 下 database is locked 一撞就报错。
+    # WAL 让读写并发，busy_timeout 把剩余写冲突排队 5s。
+    await conn.execute("PRAGMA journal_mode=WAL")
+    await conn.execute("PRAGMA busy_timeout=5000")
+    await conn.commit()
     saver = AsyncSqliteSaver(conn)
     await saver.setup()
 
@@ -96,10 +104,23 @@ async def build_engine(
 async def build_engine_with_saver(settings: Settings, event_sink: EventSink | None = None,
                                  journal: ToolJournal | None = None,
                                  span_sink: SpanSink | None = None):
-    """一次性构建并持有 saver（Celery 任务运行用）。返回 (engine, closer)。"""
+    """一次性构建并持有 saver（Celery 任务运行用）。返回 (engine, closer)。
+
+    B1：closer 只在**正常返回**时才到调用方手里 —— build_engine 半途抛错
+    （LLM/注册表装配失败）时刚建立的 saver 连接无人认领，Celery worker 里
+    每次失败泄漏一整套连接。这里失败即关，再原样上抛。
+    """
     saver, closer = await build_saver(settings)
-    engine = await build_engine(settings, event_sink=event_sink, saver=saver,
-                                journal=journal, span_sink=span_sink)
+    try:
+        engine = await build_engine(settings, event_sink=event_sink, saver=saver,
+                                    journal=journal, span_sink=span_sink)
+    except BaseException:
+        if closer is not None:
+            try:
+                await closer()
+            except Exception:  # noqa: BLE001 关闭失败不该盖住真正的构建异常
+                pass
+        raise
     return engine, closer
 
 

@@ -28,7 +28,15 @@ def make_file_ops_handler(workspace: str):
         if action == "read":
             if not path.is_file():
                 raise FileNotFoundError(f"文件不存在: {args['path']}")
-            text = path.read_text(encoding="utf-8", errors="replace")[:MAX_FILE_BYTES]
+            # C2：只读前 MAX_FILE_BYTES 个字节。旧实现 read_text 整文件进内存
+            # 再切 2MB —— 工作区里躺一个 2GB 日志就足以把宿主进程 OOM 掉，
+            # "单文件大小限制"只限了返回体，没限住峰值内存。
+            with path.open("rb") as f:
+                raw = f.read(MAX_FILE_BYTES)
+                has_more = bool(f.read(1))
+            text = raw.decode("utf-8", errors="replace")
+            if has_more:
+                text += "\n…[文件超过 2MB，已截断]"
             return {"result": text, "summary": f"读取 {args['path']}（{len(text)} 字符）"}
 
         if action == "write":
@@ -68,4 +76,5 @@ FILE_OPS_SPEC_KWARGS = dict(
     },
     key_result=True,
     key_output_limit=800,
+    side_effect=True,  # write 动作会落盘改文件
 )

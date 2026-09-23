@@ -16,8 +16,9 @@ async def test_compression_kicks_in_and_shrinks():
     llm = FakeScriptedLLM([{"text": "此前完成了 14 步查询，确认了北京 31℃、上海 28℃ 的数据。"}])
     msgs = _long_history(20)
     assert needs_compression(msgs, 2000)
-    compressed, summary = await compress_messages(llm, msgs, 2000)
+    compressed, summary, tokens = await compress_messages(llm, msgs, 2000)
     assert summary != ""
+    assert tokens > 0  # H5：摘要调用的 token 必须回传，供调用方上卷进预算
     assert estimate_messages_tokens(compressed) < estimate_messages_tokens(msgs)
     # 摘要消息在最前，最近 6 条原样保留
     assert "先前执行摘要" in compressed[0]["content"]
@@ -27,8 +28,8 @@ async def test_compression_kicks_in_and_shrinks():
 async def test_compression_noop_under_threshold():
     llm = FakeScriptedLLM([])
     msgs = _long_history(2)
-    compressed, summary = await compress_messages(llm, msgs, 100000)
-    assert compressed == msgs and summary == ""
+    compressed, summary, tokens = await compress_messages(llm, msgs, 100000)
+    assert compressed == msgs and summary == "" and tokens == 0
 
 
 def test_key_outputs_injection():

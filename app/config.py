@@ -1,7 +1,14 @@
-"""全局配置。所有可调参数集中在 Settings，支持 .env 覆盖。"""
+"""全局配置。所有可调参数集中在 Settings，支持 .env 覆盖。
+
+凭据字段（llm_api_key / admin_api_key / bocha_api_key）用 `SecretStr`：
+任何对 Settings 的整体 repr / 异常日志 / 调试 dump 都只出现 `**********`，
+明文只在显式 `get_secret_value()` 的出网比对处落地。
+"""
 from functools import lru_cache
 from pathlib import Path
+from typing import Literal
 
+from pydantic import SecretStr
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
@@ -17,11 +24,16 @@ class Settings(BaseSettings):
     # 且带着空 key，表现为"上游 401"—— 报错指向上游，会被误诊成"key 过期"。
     # 凭据永远只来自 .env：llm_api_key 默认为空，未配置时应当**显式报错**而不是拿空 key 去打上游。
     llm_base_url: str = "https://dashscope.aliyuncs.com/compatible-mode/v1"
-    llm_api_key: str = ""
+    llm_api_key: SecretStr = SecretStr("")
     llm_model: str = "qwen-plus"
     # 留空 = 不降级（超预算直接终止汇报）。这是保守兜底，不随 .env 一起改，
     # 免得"没配 .env"的环境顺带获得了它没要求的降级行为。
     llm_model_cheap: str = ""
+    # LLM 出网防护：单次请求超时（秒，openai SDK 默认 600s 对交互任务形同无限等待）；
+    # 可重试类故障（连接/超时/429/5xx）的同模型退避重试次数，0 = 不重试。
+    # 重试仍失败时，若配了 llm_model_cheap 则自动换它再试一轮（只救瞬时故障）。
+    llm_timeout_s: float = 60.0
+    llm_max_retries: int = 2
 
     # 存储
     database_url: str = f"sqlite+aiosqlite:///{PROJECT_ROOT / 'data/agent.db'}"
@@ -32,7 +44,9 @@ class Settings(BaseSettings):
     #   进程被硬杀（kill -9 / TerminateProcess）时会丢掉最后几个 superstep 的 checkpoint
     #   —— 实测 12 次硬杀里 5 次丢到只剩初始状态，导致"崩了能恢复"实际不成立。
     #   sync 的代价是每个 superstep 多等一次写盘（吞吐会下降），这正是可恢复性的真实成本。
-    checkpoint_durability: str = "sync"
+    #   Literal 收紧：配错（"Sync"/"sync "）在**构造 Settings 时**即 ValidationError，
+    #   不再拖到每个任务首个 checkpoint 才炸、被队列折叠成 failed。
+    checkpoint_durability: Literal["sync", "async", "exit"] = "sync"
 
     # 队列
     queue_mode: str = "local"  # local | celery
@@ -40,6 +54,10 @@ class Settings(BaseSettings):
     max_concurrent_tasks: int = 4
     # 优雅停机：先等在跑任务自然结束（排空），超时才取消。0 = 不排空直接取消
     shutdown_drain_timeout_s: float = 10.0
+    # H8：celery 模式单任务硬时限（秒）。worker 被 SIGKILL/OOM 带走时，
+    # 它跑的 running 行没人写终态、永久锁死 L4 在途配额；时限保证"活着的
+    # 任务不可能比它更老"，孤儿清扫（fail_stale_active_tasks）据此放心判死。
+    celery_task_time_limit_s: int = 900
 
     # 子 Agent（agent-as-tool）
     max_concurrent_subagents: int = 2
@@ -49,7 +67,12 @@ class Settings(BaseSettings):
 
     # 沙箱
     sandbox_mode: str = "auto"  # auto | docker | local
-    allow_unsafe_local_exec: bool = True
+    # H9：默认关闭**自动回退**。旧默认 True 的组合是"默认不安全"：Docker 任何
+    # 异常都被静默吞掉、降级 LocalSandbox —— 模型生成代码与服务进程同 uid 执行，
+    # 可直连 redis/postgres、可读 LLM_API_KEY。现在：显式 sandbox_mode=local
+    # 仍然可用（那是人的决定，开发/CI 场景）；auto 回退必须显式打开本开关，
+    # 且回退时打 CRITICAL 并暴露在 /health（不再静默）。
+    allow_unsafe_local_exec: bool = False
     sandbox_image: str = "agent-sandbox:latest"
     sandbox_timeout_s: float = 30.0
     sandbox_mem_limit: str = "256m"
@@ -67,6 +90,10 @@ class Settings(BaseSettings):
     # 出计划后升级 plan_execute（修复"react 重规划出的计划没有执行轨道"的缺口）。
     # 0 = 关闭降级（重规划永不放弃）。
     adaptive_downgrade_after_replans: int = 2
+    # H6：react↔plan_execute 互切次数上限（升级与降级各计一次）。超限后 planner
+    # 不再升级到 plan_execute；critic 若还要降级则直接判 failed——反复切换本身
+    # 就是"两条轨道都被证伪"的信号，继续切只是换方向烧 token。
+    max_mode_switches: int = 3
 
     # 工具瞬时错误的原样重试（仅对声明 retry_transient 的工具生效）
     # 0 = 关闭自动重试，退回「交给 critic / 模型层决策」的旧行为
@@ -78,26 +105,27 @@ class Settings(BaseSettings):
     # auth_enabled 默认开启（默认安全）：关闭它等于把「任何人可提交任务烧 token」敞开，
     # 仅限本机开发，与 ALLOW_UNSAFE_LOCAL_EXEC 同一性质的选择。
     auth_enabled: bool = True
-    # 本机（回环地址）免密放行：默认开启。
+    # 本机（回环地址）免密放行：默认开启，但带**前置代理护栏**（H12）。
     #
     # 解决的问题：一键启动脚本拉起服务后浏览器打开 127.0.0.1:8000，页面右上角却要求
     # 手填 X-API-Key（该 key 只在 data/api_credentials.json 里，且启动脚本不该把它
     # 回显到终端/写进页面）—— 演示体验因此断在第一步。
     #
-    # 为什么是「按来源地址判定」而不是直接 auth_enabled=false：
-    #   * 回环地址只可能是本机进程发起的请求（浏览器/curl/本机脚本），放行它们等于
-    #     「本机零配置可用」，正是双击启动想要的；
-    #   * 一旦经 ngrok / 反向代理暴露到公网，request.client.host 是代理或真实远端 IP，
-    #     **不是**回环地址 → 仍然要求密钥。也就是说这个开关不会在"把地址发给别人"
-    #     的那一刻把 LLM 账单敞开。
-    # 需要严格模式（本机也要密钥）时设 AUTH_LOCALHOST_BYPASS=false 即可。
+    # H12 修正的旧断言：此前注释称"经 ngrok/反代暴露后 client.host 是代理或真实
+    # 远端 IP"——**同机部署时这是错的**：ngrok/nginx 与本平台同机，socket 对端
+    # 就是 127.0.0.1，所有外部用户都会命中免密分支共享 default 租户。
+    # 现在 `_localhost_bypass_allowed` 在 trusted_proxy_hops=0 时额外检查：
+    # 回环来源请求只要携带 X-Forwarded-For / X-Real-IP / Forwarded 中任意一个
+    # （正规代理都会写），一律拒绝免密并记 warning —— "忘了关旁路"从静默敞开
+    # 变成显式 401 + 日志。护栏拦不住"完全不写转发头的代理"，生产前置代理仍应
+    # 设 AUTH_LOCALHOST_BYPASS=false；启动日志会为此专门告警一次（bootstrap_auth）。
     auth_localhost_bypass: bool = True
     # 显式声明「可信代理」数量：置 >1 时才信任 X-Forwarded-For 的右侧第 N 跳。
     # 默认 0 = **完全不信任**该头（客户端可随意伪造它，信了等于把鉴权交给攻击者）。
     # 只有在你自己控制的反向代理后面、且代理会覆写该头时才设置。
     trusted_proxy_hops: int = 0
     # 管理员密钥：留空则首次启动生成并写入 credentials_file（env 优先于文件）
-    admin_api_key: str = ""
+    admin_api_key: SecretStr = SecretStr("")
     credentials_file: str = str(PROJECT_ROOT / "data/api_credentials.json")
     # 新租户默认每日 token 配额（0 = 不限）。
     # 2026-09-22 由 200_000 上调至 2_000_000：一次深检索任务实耗 6万~13万 token
@@ -115,6 +143,12 @@ class Settings(BaseSettings):
     tenant_submit_per_min: int = 20        # L2 每租户每分钟提交任务数（10 → 20，提交本身不产生模型成本）
     tenant_daily_task_limit: int = 500     # L2b 每租户每日提交任务数（200 → 500）
     global_daily_task_limit: int = 3000    # L3 全局每日提交任务数（资金护栏，1000 → 3000）
+    # L1 豁免全部读请求（含 SSE）后的两个补充闸（D2）：
+    # SSE 长连接每条都以 0.4s 间隔轮询 DB、最长挂 300s，并发不设上限即可
+    # 用几十条连接拖垮库连接池；admin key 的爆破尝试也必须计节流。
+    sse_max_concurrent_per_tenant: int = 4     # 每租户并发 SSE 流上限（0=关闭）
+    sse_max_concurrent_total: int = 64         # 进程级并发 SSE 流总上限（0=关闭）
+    admin_auth_fail_per_min: int = 10          # 每 IP 每分钟 admin 端点尝试数（暴破节流）
 
     # 可观测性（P2-5）
     # 日志：json = 单行结构化（采集器直接解析字段）；text = 人类可读旧格式
@@ -161,11 +195,11 @@ class Settings(BaseSettings):
     # 默认 mock 是刻意选择：不配 .env 的调用方（含全部测试与离线脚本）必须不出网。
     # auto 会按 bocha（若配了 key）→ sogou → bing → ddgs 依次尝试，
     # 用相关性校验挑第一个可用的源。
-    search_provider: str = "mock"  # mock | auto | bocha | sogou | bing | ddgs
+    search_provider: str = "mock"  # mock | auto | bocha | sogou | bing | ddgs；配错启动即报错，不会静默走 mock
     # 博查 Web Search API（可选）：配了 key 才会启用，auto 会优先用它 ——
     # 免 key 的网页抓取源（sogou/bing）存在反爬限流与"年份词条"退化，正式 API 更稳。
     # 申请：https://open.bocha.cn → API KEY 管理。留空则完全跳过该源（零配置开箱可用）。
-    bocha_api_key: str = ""
+    bocha_api_key: SecretStr = SecretStr("")
     tool_timeout_s: float = 30.0
     max_concurrent_tools: int = 4
 

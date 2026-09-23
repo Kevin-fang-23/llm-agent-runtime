@@ -170,6 +170,40 @@ class PerIpRateLimitMiddleware:
         await self.app(scope, receive, send)
 
 
+class ConcurrencyGate:
+    """并发槽位闸（D2：SSE 长连接上限）。
+
+    与分钟级限流器的区别：占的是**时长**而非**速率** —— 一条 SSE 挂 300s，
+    每条都以 0.4s 轮询 DB，无上限时几十条连接就能拖垮库连接池，而这种消耗
+    用"每分钟请求数"根本表达不出来。计数与增减都在同一事件循环刻度内完成，
+    asyncio 单线程下天然原子，无需加锁。多 worker 时每进程各持额度
+    （与 memory 限流器同一口径）。0/负值表示该维度关闭。
+    """
+
+    def __init__(self, per_tenant: int, total: int) -> None:
+        self.per_tenant = per_tenant
+        self.total = total
+        self._counts: dict[str, int] = {}
+        self._active = 0
+
+    def try_acquire(self, tenant_id: str) -> bool:
+        if self.total > 0 and self._active >= self.total:
+            return False
+        if self.per_tenant > 0 and self._counts.get(tenant_id, 0) >= self.per_tenant:
+            return False
+        self._active += 1
+        self._counts[tenant_id] = self._counts.get(tenant_id, 0) + 1
+        return True
+
+    def release(self, tenant_id: str) -> None:
+        self._active = max(0, self._active - 1)
+        n = self._counts.get(tenant_id, 0) - 1
+        if n <= 0:
+            self._counts.pop(tenant_id, None)
+        else:
+            self._counts[tenant_id] = n
+
+
 def day_start_epoch() -> float:
     """本地时区「今天零点」的 epoch 秒 —— 日级额度的窗口起点。"""
     now = datetime.now().astimezone()

@@ -35,6 +35,7 @@ from app.observability.context import (
     current_trace_id,
     new_span_id,
     span_id_var,
+    task_id_var,
     trace_id_var,
 )
 
@@ -64,20 +65,44 @@ class _SpanBuffer:
     里不能安全 await 落库 —— 那会把已完成的工作卡在一个可能失败的网络/磁盘操作上。
     因此 `span()` 只把已闭合的 span 推进缓冲，由调用方（`engine.flush_spans`）
     在安全点批量写出。
+
+    **M2（按任务取件）**：`drain_for(task_id)` 只取走属于该任务的 span，
+    其余留在缓冲里等各自的任务来收。旧实现只有整体 `drain()` + 落库前统一盖
+    "当前任务"的章 —— 并发 4 个任务时，A 先结束就会把 B/C 的 span 认领到自己名下。
+    归属在 **span 开启时**由 `task_id_var` 捕获（闭合可能发生在上下文复位之后），
+    事后不再改判。
+
+    缓冲有界（`max_pending`）：任务硬失败后再也不会回来 flush，其滞留 span
+    若无人认领会一直占内存；溢出时丢最旧（span 是观测数据，丢尾不丢新）。
     """
 
-    def __init__(self) -> None:
+    def __init__(self, max_pending: int = 2000) -> None:
         self._lock = threading.Lock()
         self._pending: list[dict] = []
+        self.max_pending = max_pending
 
     def add(self, span: dict) -> None:
         with self._lock:
+            if len(self._pending) >= self.max_pending:
+                dropped = self._pending.pop(0)
+                log.warning(
+                    "span 缓冲溢出（上限 %d），丢弃最旧一条 task=%s kind=%s",
+                    self.max_pending, dropped.get("task_id", ""), dropped.get("kind", ""))
             self._pending.append(span)
 
     def drain(self) -> list[dict]:
         with self._lock:
             pending, self._pending = self._pending, []
             return pending
+
+    def drain_for(self, task_id: str) -> list[dict]:
+        """取走并返回该任务名下已闭合的 span；其他任务的原样留在缓冲。"""
+        with self._lock:
+            mine = [s for s in self._pending if s.get("task_id") == task_id]
+            if mine:
+                self._pending = [s for s in self._pending
+                                 if s.get("task_id") != task_id]
+            return mine
 
     def peek(self) -> list[dict]:
         with self._lock:
@@ -107,7 +132,7 @@ class SpanSession:
     显式 API 让"拿句柄"与"开 span"两步都可见，不再依赖 `__enter__` 的返回约定。
     """
 
-    __slots__ = ("handle", "_token", "_closed", "_trace_token")
+    __slots__ = ("handle", "_token", "_closed", "_trace_token", "_task_id")
 
     def __init__(self, kind: str, name: str, trace_id: str = "",
                  attributes: dict[str, Any] | None = None):
@@ -122,6 +147,9 @@ class SpanSession:
         # trace_id_var.set 永远安全（ContextVar 有默认值），token 供 end 时还原。
         self._trace_token = trace_id_var.set(trace)
         self._token = span_id_var.set(self.handle.span_id)
+        # M2：归属在**开 span 时**捕获 —— root span 于 run_task 的 finally 之后
+        # 才闭合，那时 task_id_var 已复位，闭合时再读会拿到空串
+        self._task_id = task_id_var.get()
         self._closed = False
 
     def set_attribute(self, key: str, value: Any) -> None:
@@ -142,6 +170,9 @@ class SpanSession:
             self.handle.set_attribute("error", type(exc).__name__)
         self.handle.close()
         record = self.handle.to_dict()
+        # M2：记下开 span 时所属的任务（见 __init__）——落库按此归属分拣，
+        # 并发任务的 flush 不会互相认领对方的 span
+        record["task_id"] = self._task_id
         BUFFER.add(record)
         return record
 
@@ -160,9 +191,13 @@ def begin_span(kind: str, name: str, trace_id: str = "",
 
 
 @contextmanager
-def span(kind: str, name: str, *, trace_id: str = "", sink: SpanSink | None = None,
+def span(kind: str, name: str, *, trace_id: str = "",
          attributes: dict[str, Any] | None = None) -> Iterator[SpanHandle]:
     """开一个 span，退出时闭合（含异常路径）并推进缓冲。
+
+    落库**只有一条路径**：闭合的 span 进 `BUFFER`，由 `engine.flush_spans` 在安全点
+    批量写给 sink —— 这里不提供 `sink` 参数（旧签名带它却从不使用，传了也不会
+    自动落库，属于说谎的 API）。
 
     用法（与 `contextlib` 惯例一致，异常透传但 span 一定闭合）：
 

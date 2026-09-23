@@ -89,7 +89,10 @@ def test_events_query_still_supports_incremental(client):
 
 
 def test_events_have_composite_index(client):
-    """(task_id, seq) 复合索引必须存在 —— 增量推送走的是这个范围扫描。"""
+    """(task_id, seq) 复合**唯一**索引必须存在 —— 增量推送走这个范围扫描，
+    唯一性是 H11 的护栏：seq 每任务续号后任何撞号写入都应直接失败暴露 bug。"""
     from app.storage.models import Event
-    names = {ix.name for ix in Event.__table__.indexes}
-    assert "ix_events_task_seq" in names, f"缺少复合索引，现有：{names}"
+    idx = {ix.name: ix for ix in Event.__table__.indexes}
+    assert "uq_events_task_seq" in idx, f"缺少唯一复合索引，现有：{set(idx)}"
+    assert idx["uq_events_task_seq"].unique is True
+    assert "ix_events_task_seq" not in idx  # 旧的非唯一索引已被迁移取代

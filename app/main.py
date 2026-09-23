@@ -24,7 +24,12 @@ from pathlib import Path
 from fastapi import FastAPI, Request
 from fastapi.responses import FileResponse, JSONResponse, PlainTextResponse
 
-from app.api.ratelimit import DbWindowLimiter, PerIpRateLimitMiddleware, SlidingWindowLimiter
+from app.api.ratelimit import (
+    ConcurrencyGate,
+    DbWindowLimiter,
+    PerIpRateLimitMiddleware,
+    SlidingWindowLimiter,
+)
 from app.api.routes_admin import router as admin_router
 from app.api.routes_tasks import router as tasks_router
 from app.api.security import TenantRegistry, bootstrap_auth
@@ -107,6 +112,11 @@ async def lifespan(app: FastAPI):
     # llm + registry 先行构建：/api/tools 展示的清单与引擎实际可用工具同源
     llm = build_llm(settings)
     registry = build_default_registry(settings, llm=llm)  # 沙箱在此按配置创建
+    # H9：沙箱装配结果（docker/local、是否发生过 auto→local 降级）落到 app.state，
+    # /health 直接可读 —— "现在到底在哪个后端上跑模型代码"不该靠翻日志发现
+    from app.executor.sandbox import LAST_BUILD_INFO
+
+    app.state.sandbox_info = dict(LAST_BUILD_INFO)
 
     async def event_sink(event: dict) -> None:
         await repo.append_event(event)
@@ -132,6 +142,10 @@ async def lifespan(app: FastAPI):
     app.state.rate_limiter = (
         DbWindowLimiter(repo) if settings.rate_limit_store == "db"
         else SlidingWindowLimiter())
+    # D2：SSE 长连接是"占时长"而非"占速率"的资源，分钟级限流表达不了，
+    # 用独立的并发闸（每租户 + 进程总额度）
+    app.state.stream_gate = ConcurrencyGate(
+        settings.sse_max_concurrent_per_tenant, settings.sse_max_concurrent_total)
 
     app.state.repo = repo
     app.state.registry = registry
@@ -170,8 +184,14 @@ async def index():
 
 
 @app.get("/health", include_in_schema=False)
-async def health():
-    return {"status": "ok"}
+async def health(request: Request):
+    body: dict = {"status": "ok"}
+    info = getattr(request.app.state, "sandbox_info", None)
+    if info:
+        # isolated=false + fallback_reason 非空 = Docker 不可用被降级到本地沙箱，
+        # 无网络隔离（H9：降级不再静默，这里就是它的可见出口）
+        body["sandbox"] = info
+    return body
 
 
 def _prometheus_route():

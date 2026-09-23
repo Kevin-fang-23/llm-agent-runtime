@@ -34,9 +34,18 @@ async def handler(args: dict[str, Any]) -> dict[str, Any]:
             f"天气查询失败（HTTP {r.status_code}），请检查城市名（建议用拼音/英文名）",
             retry_after_s=parse_retry_after(r.headers.get("Retry-After")),
         )
-    d = r.json()
-    cur = d["current_condition"][0]
-    today = d.get("weather", [{}])[0]
+    # C4：wttr.in 会随机返回 200 + 非 JSON/缺字段的畸形体。JSONDecodeError 是
+    # ValueError 子类，会被 registry 折叠成 INVALID_ARGS → critic 判 plan_defect
+    # 去改参数重规划（城市名没错，白耗一步）；KeyError/IndexError 则落 UNKNOWN
+    # 走文本兜底。显式归为上游服务错误：可重试，且重试同一条请求就有自愈概率。
+    try:
+        d = r.json()
+        cur = d["current_condition"][0]
+        today = d.get("weather", [{}])[0]
+    except (ValueError, KeyError, IndexError, TypeError) as e:
+        raise ToolExecutionError(
+            f"天气服务返回畸形数据（HTTP 200 但不是可解析的天气 JSON）: {e}",
+            code=ToolErrorCode.UPSTREAM_5XX) from e
     desc = (cur.get("weatherDesc") or [{}])[0].get("value", "")
     result = {
         "city": city,

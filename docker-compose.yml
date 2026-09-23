@@ -1,15 +1,26 @@
 # 完整模式编排：PostgreSQL（业务库+checkpoint）+ Redis（队列）+ API + Celery worker
-# 前置：cp .env.example .env 并填入 LLM 配置；构建沙箱镜像（worker 拉起沙箱容器时使用）：
+# 前置：cp .env.example .env 并填入 LLM 配置与 REDIS_PASSWORD（H10：Redis 强制认证，
+#       未认证 broker = 任何人可注入任务烧 token）；构建沙箱镜像（worker 拉起沙箱容器时使用）：
 #   docker build -t agent-sandbox:latest ./sandbox
 # 启动：docker compose up --build
+#
+# H10 安全收紧：
+#   - PG/Redis **不再发布到 0.0.0.0**：服务间走 compose 内部网络；开发想从宿主
+#     连库调试时端口只绑 127.0.0.1（默认干脆不发布）。
+#   - 口令从 .env 注入（POSTGRES_PASSWORD / REDIS_PASSWORD），不再硬编码 agent。
+#   - 已知残余风险（有意保留，本地演示取舍）：worker 挂 /var/run/docker.sock
+#     等价于给容器进程宿主 root 能力 —— 沙箱方案要求 worker 能拉起兄弟容器。
+#     生产多租户部署应换成 rootless docker / 远程隔离集群，勿直接复用本文件。
 services:
   postgres:
     image: postgres:16-alpine
     environment:
       POSTGRES_USER: agent
-      POSTGRES_PASSWORD: agent
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?POSTGRES_PASSWORD 未设置，请先 cp .env.example .env 并填写}
       POSTGRES_DB: agent
-    ports: ["5432:5432"]
+    # 默认不发布端口：容器间在 compose 网络内直连。
+    # 需要从宿主调试时取消注释（刻意只绑回环，不暴露局域网）：
+    # ports: ["127.0.0.1:5432:5432"]
     volumes: ["pgdata:/var/lib/postgresql/data"]
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U agent"]
@@ -18,16 +29,18 @@ services:
 
   redis:
     image: redis:7-alpine
-    ports: ["6379:6379"]
+    # requirepass：未认证的 Redis 会让任何人直接向队列注入任务（烧共享 LLM key）
+    command: ["redis-server", "--requirepass", "${REDIS_PASSWORD:?REDIS_PASSWORD 未设置，请先 cp .env.example .env 并填写}"]
+    # ports: ["127.0.0.1:6379:6379"]   # 同上：默认不发布，调试时解注释且只绑回环
 
   api:
     build: .
     ports: ["8000:8000"]
     environment:
-      DATABASE_URL: postgresql+asyncpg://agent:agent@postgres:5432/agent
+      DATABASE_URL: postgresql+asyncpg://agent:${POSTGRES_PASSWORD}@postgres:5432/agent
       CHECKPOINT_DB: postgres
       QUEUE_MODE: celery
-      REDIS_URL: redis://redis:6379/0
+      REDIS_URL: redis://:${REDIS_PASSWORD}@redis:6379/0
       LLM_BASE_URL: ${LLM_BASE_URL}
       LLM_API_KEY: ${LLM_API_KEY}
       LLM_MODEL: ${LLM_MODEL}
@@ -39,17 +52,22 @@ services:
     build: .
     command: celery -A app.worker.celery_app:celery worker --loglevel=info --concurrency=4
     environment:
-      DATABASE_URL: postgresql+asyncpg://agent:agent@postgres:5432/agent
+      DATABASE_URL: postgresql+asyncpg://agent:${POSTGRES_PASSWORD}@postgres:5432/agent
       CHECKPOINT_DB: postgres
       QUEUE_MODE: celery
-      REDIS_URL: redis://redis:6379/0
+      REDIS_URL: redis://:${REDIS_PASSWORD}@redis:6379/0
       LLM_BASE_URL: ${LLM_BASE_URL}
       LLM_API_KEY: ${LLM_API_KEY}
       LLM_MODEL: ${LLM_MODEL}
     volumes:
       # worker 在自己容器里调用宿主机 Docker daemon 拉起沙箱容器
-      # （Linux 适用；Win/Mac 需在宿主机单独跑 worker，见 README）
+      # （Linux 适用；Win/Mac 需在宿主机单独跑 worker，见 README）。
+      # ⚠ 该挂载 ≈ 宿主 root，生产部署的风险与替代方案见文件头"已知残余风险"。
       - /var/run/docker.sock:/var/run/docker.sock
+    # A10：镜像默认用户已是 appuser（非 root），而 docker.sock 属组 docker、
+    # 权限 660 —— 不补组授权 worker 会直接 Permission denied。group_add 由
+    # daemon 按宿主 /etc/group 解析 docker 组 GID 注入容器进程。
+    group_add: ["docker"]
     depends_on:
       postgres: {condition: service_healthy}
       redis: {condition: service_started}

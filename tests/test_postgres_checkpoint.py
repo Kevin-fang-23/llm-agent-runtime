@@ -159,7 +159,10 @@ async def test_postgres_migrations_alembic_bootstrap(settings, pg_url):
 
         rows = (await (await engine.connect()).execute(
             text("SELECT version_num FROM alembic_version"))).all()
-        assert rows and rows[0][0] == "0001"
+        # 钉在当前 head（0003 = 基线 + events 唯一约束 + server_default 补挂）。
+        # 旧库引导走 stamp head，0003 的 ALTER 不在此路径执行；PG 侧的
+        # 0001→0002→0003 完整 upgrade 链由本模块其他用例的全新库路径执行。
+        assert rows and rows[0][0] == "0003"
 
         legacy = await repo.get_task("pg-mig-legacy")
         assert legacy is not None and legacy["tenant_id"] == ""
